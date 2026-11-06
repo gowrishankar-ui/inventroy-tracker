@@ -59,12 +59,13 @@ const STUDENT_DOMAIN = '@protosem.tech';
 const ROLE = {student:'Student', engineer:'Engineer', manager:'Manager', spalead:'SPA Lead', admin:'Engineers-Admin'};
 const CATS = {asset:'Asset', reusable:'Reusable', consumable:'Consumables'};
 const APPROVERS = ['engineer','manager','spalead','admin'];
-const ST = {pending:['Pending','b-warn'], approved:['Approved','b-info'], collected:['Collected','b-ok'], rejected:['Rejected','b-bad']};
+const ST = {pending:['Pending','b-warn'], approved:['Approved','b-info'], collected:['Collected','b-ok'], returned:['Returned','b-info'], rejected:['Rejected','b-bad']};
 const TEMPLATE = 'Component Name,Specifications,Overall Qty,Working Qty,Damaged Qty,Current Qty,Location,BoQ Type\nArduino Uno R3,ATmega328P board,20,18,2,18,Shelf A1,Asset\nBME280 Sensor,I2C temp and humidity,10,10,0,10,Lab C1,Consumable\n';
 
 /* ================= State ================= */
 let ME = null, P = null, CH = null;
-let S = {components:[], requests:[], logs:[], imports:[], profiles:[]};
+let S = {components:[], requests:[], logs:[], imports:[], profiles:[], notes:[]};
+let POLL = null, TICK = 0, DIRTY = false;
 let U = {tab:'', q:'', ask:null, askAcc:null, preview:null, fileName:''};
 
 /* ================= Helpers ================= */
@@ -97,12 +98,14 @@ async function logMsg(message){
 }
 
 /* ================= Data ================= */
-async function loadData(){
+async function loadData(full){
   const q = [
     SB.from('components').select('*').order('name'),
-    SB.from('requests').select('*').order('created_at', {ascending:false})
+    SB.from('requests').select('*').order('created_at', {ascending:false}),
+    SB.from('notifications').select('*').order('created_at', {ascending:false}).limit(50)
   ];
-  if (P.role === 'admin') q.push(
+  const adminExtra = P.role === 'admin' && (full || TICK % 4 === 0);
+  if (adminExtra) q.push(
     SB.from('profiles').select('*').order('email'),
     SB.from('activity_logs').select('*').order('created_at', {ascending:false}).limit(300),
     SB.from('imports').select('*').order('created_at', {ascending:false}).limit(50)
@@ -110,16 +113,25 @@ async function loadData(){
   const res = await Promise.all(q);
   const err = res.find(x => x.error);
   if (err) return toast('Could not load data: ' + err.error.message);
-  S.components = res[0].data; S.requests = res[1].data;
-  if (P.role === 'admin'){ S.profiles = res[2].data; S.logs = res[3].data; S.imports = res[4].data; }
-  render();
+  S.components = res[0].data; S.requests = res[1].data; S.notes = res[2].data;
+  if (adminExtra){ S.profiles = res[3].data; S.logs = res[4].data; S.imports = res[5].data; }
+  paint();
+}
+// Do not redraw while someone is typing in a form; redraw as soon as they leave the field
+function isTyping(){ return ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName); }
+function paint(){ if (isTyping()){ DIRTY = true; return; } DIRTY = false; render(); }
+document.addEventListener('focusout', () => { if (DIRTY) setTimeout(paint, 150); });
+function startPolling(){
+  if (POLL) return;
+  POLL = setInterval(() => { TICK++; loadData(); }, 4000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) loadData(true); });
 }
 async function run(promise, okMsg, logText){
   const {error} = await promise;
   if (error) return toast(error.message);
   if (logText) await logMsg(logText);
   if (okMsg) toast(okMsg);
-  await loadData();
+  await loadData(true);
 }
 async function loadProfile(){
   const {data} = await SB.from('profiles').select('*').eq('id', ME.id).maybeSingle();
@@ -127,6 +139,7 @@ async function loadProfile(){
   if (P?.role){
     await loadData();
     if (!CH) CH = SB.channel('live').on('postgres_changes', {event:'*', schema:'public'}, () => loadData()).subscribe();
+    startPolling();
   }
   render();
 }
@@ -144,6 +157,7 @@ async function signUp(){
 }
 async function signOut(){
   if (CH){ SB.removeChannel(CH); CH = null; }
+  if (POLL){ clearInterval(POLL); POLL = null; }
   await SB.auth.signOut();
 }
 SB.auth.onAuthStateChange((_e, s) => { ME = s?.user || null; P = null; if (ME) loadProfile(); else render(); });
@@ -182,9 +196,14 @@ function submitReq(){
   run(SB.from('requests').insert({component_id: cid, qty: q, purpose, scope}), 'Request sent for approval',
     `${P.name} requested ${q} × ${c?.name} (${scope === 'spa' ? 'SPA' : 'Team'})`);
 }
-function decide(id, dec){
+async function decide(id, dec){
   const reason = dec === 'rejected' ? (v('rr'+id) || null) : null;
-  run(SB.rpc('decide_request', {req_id: id, decision: dec, reason}), dec === 'approved' ? 'Approved' : 'Rejected');
+  const r = S.requests.find(x => x.id === id);
+  if (r){ r.status = dec; render(); }            // show the new status at once
+  const {error} = await SB.rpc('decide_request', {req_id: id, decision: dec, reason});
+  if (error){ toast(error.message); return loadData(true); }
+  toast(dec === 'approved' ? 'Approved' : 'Rejected');
+  loadData(true);
 }
 function collect(id){ run(SB.rpc('collect_request', {req_id: id}), 'Collected, stock updated'); }
 
@@ -417,6 +436,20 @@ function vReq(){
       <div><button class="btn" onclick="submitReq()">Submit request</button></div>
     </div></div>`;
 }
+function actionCell(r, adm){
+  const own = r.requester_id === ME.id;
+  if (r.status === 'approved' && (adm || own))
+    return `<button class="btn ok sm" onclick="collect('${r.id}')">Mark collected</button>`;
+  if (r.status === 'collected'){
+    let out = '';
+    if (own || adm) out += `<button class="btn sm" onclick="returnItem('${r.id}')">Return to inventory</button> `;
+    if (adm) out += `<button class="btn ghost sm" onclick="remind('${r.id}')">Send return reminder</button>`;
+    if (r.reminded_at) out += ` <span class="muted">Reminded ${fmt(r.reminded_at)}</span>`;
+    return out;
+  }
+  if (r.status === 'returned') return `<span class="muted">Returned ${r.returned_at ? fmt(r.returned_at) : ''}</span>`;
+  return '';
+}
 function vMy(){
   const adm = P.role === 'admin';
   const list = S.requests.filter(r => adm || r.requester_id === ME.id);
@@ -425,8 +458,7 @@ function vMy(){
     ['Item','Qty','Purpose','Used for','Requested by','Submitted','Status','Action'],
     list.map(r => [esc(compName(r.component_id)), r.qty, esc(r.purpose), scopeBadge(r.scope),
       esc(r.requester_name), fmt(r.created_at), badge(ST[r.status][0], ST[r.status][1]),
-      r.status === 'approved' && (adm || r.requester_id === ME.id)
-        ? `<button class="btn ok sm" onclick="collect('${r.id}')">Mark collected</button>` : '']))}</div>`;
+      actionCell(r, adm)]))}</div>`;
 }
 function vAppr(){
   const list = S.requests.filter(canDecide);
@@ -516,6 +548,23 @@ function vAcc(){
     </div>
     <div class="card"><h2>Accounts</h2>${tbl(['Email','Name','Role','Remove'], rows)}</div>`;
 }
+function returnItem(id){ run(SB.rpc('return_request', {req_id: id}), 'Returned to inventory'); }
+function remind(id){ run(SB.rpc('remind_return', {req_id: id}), 'Reminder sent'); }
+function unreadCount(){ return (S.notes || []).filter(n => !n.is_read).length; }
+async function markAllRead(){
+  await SB.from('notifications').update({is_read: true}).eq('is_read', false);
+  loadData(true);
+}
+function vNotes(){
+  const list = S.notes || [];
+  return `<div class="card" style="margin-bottom:16px"><div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Notifications</h2>
+      <button class="btn ghost sm" onclick="markAllRead()">Mark all read</button></div>
+    ${list.length ? '<ul style="margin:12px 0 0;padding-left:18px">' + list.map(n =>
+      `<li style="margin-bottom:6px;${n.is_read ? 'color:var(--muted)' : 'font-weight:600'}">${esc(n.message)} <span class="muted">· ${fmt(n.created_at)}</span></li>`
+    ).join('') + '</ul>' : '<p class="empty">No notifications.</p>'}
+  </div>`;
+}
 const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, dash:vDash, imp:vImp, log:vLog, acc:vAcc};
 
 function loginView(){
@@ -546,9 +595,9 @@ function render(){
   app.innerHTML = `<header>
       <div class="brand"><i></i>Component Inventory</div>
       <nav>${tabs.map(([k,l]) => `<button class="${U.tab===k?'on':''}" onclick="U.tab='${k}';render()">${l}</button>`).join('')}</nav>
-      <div class="row"><span class="badge b-info">${ROLE[P.role]}</span><span class="muted">${esc(P.name)}</span>
+      <div class="row"><button class="btn ghost sm" onclick="U.showN=!U.showN;render()">Notifications (${unreadCount()})</button><span class="badge b-info">${ROLE[P.role]}</span><span class="muted">${esc(P.name)}</span>
         <button class="btn ghost sm" onclick="signOut()">Sign out</button></div>
-    </header><main>${VIEWS[U.tab]()}</main>`;
+    </header><main>${U.showN ? vNotes() : ''}${VIEWS[U.tab]()}</main>`;
 }
 render();
 </script>
