@@ -146,7 +146,7 @@ async function loadProfile(){
 
 /* ================= Sign in / up ================= */
 async function signIn(){
-  const {error} = await SB.auth.signInWithPassword({email: v('le'), password: v('lp')});
+  const {error} = await SB.auth.signInWithPassword({email: v('le').toLowerCase(), password: v('lp')});
   if (error) toast(error.message);
 }
 async function signUp(){
@@ -525,6 +525,14 @@ function vLog(){
   return `<div class="card"><h2>Activity</h2>${tbl(['Time','By','Event'],
     S.logs.slice(0,300).map(l => [fmt(l.created_at), esc(profName(l.actor_id)), esc(l.message)]))}</div>`;
 }
+async function resetPassword(){
+  const id = v('rpuser'), pw = v('rppw');
+  if (!id || pw.length < 8) return toast('Choose an account and a password of 8+ characters');
+  if (await acctCall({action:'set_password', id, password: pw})){
+    toast('Password set. Give it to the person.');
+    document.getElementById('rppw').value = '';
+  }
+}
 function vAcc(){
   const opts = sel => [['none','No access'], ...Object.entries(ROLE)]
     .map(([k,l]) => `<option value="${k}" ${(sel || 'none') === k ? 'selected' : ''}>${l}</option>`).join('');
@@ -545,6 +553,13 @@ function vAcc(){
         <div><button class="btn" onclick="createAccount()">Create account</button></div>
       </div>
       <p class="muted" style="margin:10px 0 0">Give the person their password. Choose "No access" to block someone without deleting their history.</p>
+    </div>
+    <div class="card" style="margin-bottom:16px"><h2>Reset a password</h2>
+      <div class="form">
+        <div><label>Account</label><select id="rpuser">${S.profiles.filter(p => p.id !== ME.id).map(p => `<option value="${p.id}">${esc(p.email)}</option>`).join('')}</select></div>
+        <div><label>New password (8+ characters)</label><input id="rppw" type="password"></div>
+        <div><button class="btn" onclick="resetPassword()">Set password</button></div>
+      </div>
     </div>
     <div class="card"><h2>Accounts</h2>${tbl(['Email','Name','Role','Remove'], rows)}</div>`;
 }
