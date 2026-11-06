@@ -149,9 +149,10 @@ async function signIn(){
   const {error} = await SB.auth.signInWithPassword({email: v('le').toLowerCase(), password: v('lp')});
   if (error) toast(error.message);
 }
+const SIGNUP_DOMAINS = ['@protosem.tech', '@forge-iv.co'];
 async function signUp(){
   const email = v('le').toLowerCase();
-  if (!email.endsWith(STUDENT_DOMAIN)) return toast('Use your ' + STUDENT_DOMAIN + ' email to create an account. Others need an admin to add them.');
+  if (!SIGNUP_DOMAINS.some(d => email.endsWith(d))) return toast('Only ' + SIGNUP_DOMAINS.join(' and ') + ' email addresses can create an account.');
   const {error} = await SB.auth.signUp({email, password: v('lp'), options:{data:{name: v('ln') || email.split('@')[0]}}});
   toast(error ? error.message : 'Account created. Confirm your email, then sign in.');
 }
@@ -590,7 +591,7 @@ function loginView(){
       <div><label>Password</label><input id="lp" type="password"></div>
       <div><label>Name (for new accounts)</label><input id="ln"></div>
       <div class="row"><button class="btn" onclick="signIn()">Sign in</button><button class="btn ghost" onclick="signUp()">Create account</button></div>
-      <p class="muted" style="margin:0">Students: use your ${STUDENT_DOMAIN} email to create an account.</p>
+      <p class="muted" style="margin:0">Create an account with your @protosem.tech or @forge-iv.co email. An admin then gives you your access.</p>
     </div></div>`;
 }
 function render(){
