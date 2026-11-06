@@ -85,6 +85,10 @@ async function loadData(){
   ]);
   if (c.error || r.error) return toast('Could not load data: ' + (c.error||r.error).message);
   S.components = c.data; S.requests = r.data;
+  if (P.role === 'admin') {
+    const p = await SB.from('profiles').select('*').order('email');
+    S.profiles = p.data || [];
+  }
   render();
 }
 async function run(promise, okMsg){
@@ -238,7 +242,54 @@ function vDash(){
   </div>
   <div class="card"><h2>Utilisation (collected)</h2>${tbl(['Group','Requests collected','Units collected'], util)}</div>`;
 }
-const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, dash:vDash};
+/* ---------- Accounts (admin only, via Edge Function) ---------- */
+const FN_URL = 'https://fbxxyputyvoxczphltlx.supabase.co/functions/v1/admin-users';
+const PUB_KEY = 'sb_publishable_hxvllS0csDBvxYqMkafVIw_jwcxs4ZB';
+async function acctCall(body){
+  const {data:{session}} = await SB.auth.getSession();
+  const res = await fetch(FN_URL, {method:'POST',
+    headers:{Authorization:'Bearer '+session.access_token, apikey:PUB_KEY, 'Content-Type':'application/json'},
+    body:JSON.stringify(body)});
+  const out = await res.json().catch(()=>({error:'No response from server'}));
+  if (!res.ok || out.error) { toast(out.error || 'Request failed'); return false; }
+  return true;
+}
+async function createAccount(){
+  const email = v('ae').toLowerCase(), pw = v('ap'), name = v('an'), role = v('ar');
+  if (!email || pw.length < 8) return toast('Email and a password of 8+ characters are required');
+  if (await acctCall({action:'create', email, password:pw, name, role})) { toast('Account created'); await loadData(); }
+}
+async function setRole(id, role){
+  if (await acctCall({action:'set_role', id, role: role === 'none' ? null : role})) { toast('Access updated'); await loadData(); }
+}
+async function removeAccount(id){
+  U.ask = null;
+  if (await acctCall({action:'remove', id})) { toast('Account removed'); await loadData(); }
+}
+function vAcc(){
+  const opts = sel => [['none','No access'], ...Object.entries(ROLE)]
+    .map(([k,l]) => `<option value="${k}" ${(sel||'none')===k?'selected':''}>${l}</option>`).join('');
+  const rows = (S.profiles||[]).map(p => [
+    esc(p.email), esc(p.name),
+    p.id === ME.id ? '<span class="muted">you</span>'
+      : `<select onchange="setRole('${p.id}',this.value)">${opts(p.role)}</select>`,
+    p.id === ME.id ? '' : (U.ask === p.id
+      ? `<button class="btn bad sm" onclick="removeAccount('${p.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
+      : `<button class="btn ghost sm" onclick="U.ask='${p.id}';render()">Remove</button>`)
+  ]);
+  return `<div class="card" style="margin-bottom:16px"><h2>Add account</h2>
+    <div class="form">
+      <div><label>Email</label><input id="ae" type="email"></div>
+      <div><label>Name</label><input id="an"></div>
+      <div><label>Role</label><select id="ar">${opts('student')}</select></div>
+      <div><label>Temporary password (8+ characters)</label><input id="ap" type="password"></div>
+      <div><button class="btn" onclick="createAccount()">Create account</button></div>
+    </div>
+    <p class="muted" style="margin:10px 0 0">Give the person their password. Choose "No access" to block someone without deleting their history.</p>
+  </div>
+  <div class="card"><h2>Accounts</h2>${tbl(['Email','Name','Role','Remove'], rows)}</div>`;
+}
+const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, dash:vDash, acc:vAcc};
 
 function loginView(){
   return `<div class="login"><div class="brand" style="justify-content:center;margin-bottom:18px"><i></i>Component Inventory</div>
@@ -263,7 +314,7 @@ function render(){
   }
   const tabs = [['inv','Inventory'], ['req','New request'], ['my','Requests'],
     ...(APPROVERS.includes(P.role) ? [['appr','Approvals']] : []),
-    ...(P.role === 'admin' ? [['dash','Dashboard']] : [])];
+    ...(P.role === 'admin' ? [['dash','Dashboard'], ['acc','Accounts']] : [])];
   if (!tabs.some(t => t[0] === U.tab)) U.tab = tabs[0][0];
   app.innerHTML = `<header>
       <div class="brand"><i></i>Component Inventory</div>
