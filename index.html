@@ -118,6 +118,8 @@ async function loadData(full){
   paint();
 }
 // Do not redraw while someone is typing in a form; redraw as soon as they leave the field
+// Take focus off the current field before an action, so the screen is redrawn with the result
+function blurNow(){ const el = document.activeElement; if (el && el.blur) el.blur(); }
 function isTyping(){ return ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName); }
 function paint(){ if (isTyping()){ DIRTY = true; return; } DIRTY = false; render(); }
 document.addEventListener('focusout', () => { if (DIRTY) setTimeout(paint, 150); });
@@ -127,6 +129,7 @@ function startPolling(){
   document.addEventListener('visibilitychange', () => { if (!document.hidden) loadData(true); });
 }
 async function run(promise, okMsg, logText){
+  blurNow();
   const {error} = await promise;
   if (error) return toast(error.message);
   if (logText) await logMsg(logText);
@@ -198,6 +201,7 @@ function submitReq(){
     `${P.name} requested ${q} × ${c?.name} (${scope === 'spa' ? 'SPA' : 'Team'})`);
 }
 async function decide(id, dec){
+  blurNow();
   const reason = dec === 'rejected' ? (v('rr'+id) || null) : null;
   const r = S.requests.find(x => x.id === id);
   if (r){ r.status = dec; render(); }            // show the new status at once
@@ -358,6 +362,7 @@ async function commitImport(){
 
 /* ================= Accounts (admin only, through the Edge Function) ================= */
 async function acctCall(body){
+  blurNow();
   const {data:{session}} = await SB.auth.getSession();
   const res = await fetch(FN_URL, {method:'POST',
     headers:{Authorization:'Bearer ' + session.access_token, apikey: PUB_KEY, 'Content-Type':'application/json'},
