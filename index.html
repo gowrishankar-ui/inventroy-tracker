@@ -368,8 +368,8 @@ async function acctCall(body){
     headers:{Authorization:'Bearer ' + session.access_token, apikey: PUB_KEY, 'Content-Type':'application/json'},
     body: JSON.stringify(body)});
   const out = await res.json().catch(() => ({error:'No response from server'}));
-  if (!res.ok || out.error){ toast(out.error || 'Request failed'); return false; }
-  return true;
+  if (!res.ok || out.error){ toast(out.error || 'Request failed'); return null; }
+  return out;
 }
 async function createAccount(){
   const email = v('ae').toLowerCase(), pw = v('ap'), name = v('an'), role = v('ar');
@@ -377,7 +377,14 @@ async function createAccount(){
   if (await acctCall({action:'create', email, password: pw, name, role})){ toast('Account created'); await loadData(); }
 }
 async function setRole(id, role){
-  if (await acctCall({action:'set_role', id, role: role === 'none' ? null : role})){ toast('Access updated'); await loadData(); }
+  const out = await acctCall({action:'set_role', id, role: role === 'none' ? null : role});
+  if (!out) return;
+  // Show the role the database actually saved, straight away
+  const p = S.profiles.find(x => x.id === id);
+  if (p) p.role = out.role;
+  toast('Saved: ' + (p?.email || 'account') + ' is now ' + (out.role ? ROLE[out.role] : 'No access'));
+  render();
+  loadData(true);
 }
 async function removeAccount(id){
   U.askAcc = null;
