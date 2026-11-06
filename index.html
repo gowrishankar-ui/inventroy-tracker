@@ -540,7 +540,7 @@ function vAcc(){
   const rows = S.profiles.map(p => [
     esc(p.email), esc(p.name),
     p.id === ME.id ? '<span class="muted">you</span>'
-      : `<select onchange="setRole('${p.id}',this.value)">${opts(p.role)}</select>`,
+      : `<select id="role-${p.id}">${opts(p.role)}</select> <button class="btn ghost sm" onclick="setRole('${p.id}', document.getElementById('role-${p.id}').value)">Save role</button>`,
     p.id === ME.id ? '' : (U.askAcc === p.id
       ? `<button class="btn bad sm" onclick="removeAccount('${p.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.askAcc=null;render()">Cancel</button>`
       : `<button class="btn ghost sm" onclick="U.askAcc='${p.id}';render()">Remove</button>`)
