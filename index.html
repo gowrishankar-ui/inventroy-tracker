@@ -64,7 +64,7 @@ const TEMPLATE = 'Component Name,Specifications,Overall Qty,Working Qty,Damaged 
 
 /* ================= State ================= */
 let ME = null, P = null, CH = null;
-let S = {components:[], requests:[], logs:[], imports:[], profiles:[], notes:[]};
+let S = {components:[], requests:[], logs:[], imports:[], profiles:[], notes:[], approvals:[]};
 let POLL = null, TICK = 0, DIRTY = false;
 let U = {tab:'', q:'', ask:null, askAcc:null, preview:null, fileName:''};
 
@@ -80,10 +80,13 @@ const compName = id => S.components.find(c=>c.id===id)?.name || '(removed)';
 const findByName = n => S.components.find(c=>c.name.toLowerCase()===n.toLowerCase());
 const profName = id => S.profiles.find(p=>p.id===id)?.name || 'System';
 // Mirrors can_approve() in the database
+const SPA_ROLES = ['engineer','manager','spalead','admin'];
 function canDecide(r){
   if (r.status !== 'pending') return false;
+  if (r.scope === 'spa')
+    return r.requester_id !== ME.id && SPA_ROLES.includes(P.role)
+      && !(S.approvals || []).some(a => a.request_id === r.id && a.approver_role === P.role);
   if (P.role === 'admin') return true;
-  if (r.scope === 'spa') return r.requester_id !== ME.id && ['engineer','manager','spalead'].includes(P.role);
   return r.approver_role === P.role;
 }
 function normBoq(t){
@@ -102,7 +105,8 @@ async function loadData(full){
   const q = [
     SB.from('components').select('*').order('name'),
     SB.from('requests').select('*').order('created_at', {ascending:false}),
-    SB.from('notifications').select('*').order('created_at', {ascending:false}).limit(50)
+    SB.from('notifications').select('*').order('created_at', {ascending:false}).limit(50),
+    SB.from('approvals').select('*')
   ];
   const adminExtra = P.role === 'admin' && (full || TICK % 4 === 0);
   if (adminExtra) q.push(
@@ -113,8 +117,8 @@ async function loadData(full){
   const res = await Promise.all(q);
   const err = res.find(x => x.error);
   if (err) return toast('Could not load data: ' + err.error.message);
-  S.components = res[0].data; S.requests = res[1].data; S.notes = res[2].data;
-  if (adminExtra){ S.profiles = res[3].data; S.logs = res[4].data; S.imports = res[5].data; }
+  S.components = res[0].data; S.requests = res[1].data; S.notes = res[2].data; S.approvals = res[3].data;
+  if (adminExtra){ S.profiles = res[4].data; S.logs = res[5].data; S.imports = res[6].data; }
   paint();
 }
 // Do not redraw while someone is typing in a form; redraw as soon as they leave the field
@@ -204,7 +208,9 @@ async function decide(id, dec){
   blurNow();
   const reason = dec === 'rejected' ? (v('rr'+id) || null) : null;
   const r = S.requests.find(x => x.id === id);
-  if (r){ r.status = dec; render(); }            // show the new status at once
+  if (r && r.scope !== 'spa') r.status = dec;                 // single-approver request: show at once
+  if (r && r.scope === 'spa') S.approvals.push({request_id: id, approver_role: P.role, decision: dec});
+  if (r) render();
   const {error} = await SB.rpc('decide_request', {req_id: id, decision: dec, reason});
   if (error){ toast(error.message); return loadData(true); }
   toast(dec === 'approved' ? 'Approved' : 'Rejected');
@@ -471,7 +477,8 @@ function vMy(){
   return `<div class="card"><h2>${adm ? 'All requests' : 'My requests'}</h2>${tbl(
     ['Item','Qty','Purpose','Used for','Requested by','Submitted','Status','Action'],
     list.map(r => [esc(compName(r.component_id)), r.qty, esc(r.purpose), scopeBadge(r.scope),
-      esc(r.requester_name), fmt(r.created_at), badge(ST[r.status][0], ST[r.status][1]),
+      esc(r.requester_name), fmt(r.created_at), badge(ST[r.status][0], ST[r.status][1])
+        + (r.scope === 'spa' && r.status === 'pending' ? '<br><span class="muted" style="font-size:12px">' + spaProgress(r).replace(/<br>/g, ' · ') + '</span>' : ''),
       actionCell(r, adm)]))}</div>`;
 }
 function vAppr(){
@@ -479,7 +486,8 @@ function vAppr(){
   if (!list.length) return '<div class="card"><p class="empty">No requests waiting for your approval.</p></div>';
   return `<div class="card"><h2>Pending approvals</h2>${tbl(
     ['Requester','Role','Item','Qty','Purpose','Used for','Submitted','Decision'],
-    list.map(r => [esc(r.requester_name), ROLE[r.requester_role] || '', esc(compName(r.component_id)), r.qty,
+    list.map(r => [esc(r.requester_name), ROLE[r.requester_role] || '', esc(compName(r.component_id))
+        + (r.scope === 'spa' ? '<br><span class="muted" style="font-size:12px">' + spaProgress(r).replace(/<br>/g, ' · ') + '</span>' : ''), r.qty,
       esc(r.purpose), scopeBadge(r.scope), fmt(r.created_at),
       `<button class="btn ok sm" onclick="decide('${r.id}','approved')">Approve</button>
        <input id="rr${r.id}" placeholder="Reason (optional)" style="max-width:160px;display:inline-block;padding:4px 8px">
@@ -594,7 +602,24 @@ function vNotes(){
     ).join('') + '</ul>' : '<p class="empty">No notifications.</p>'}
   </div>`;
 }
-const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, dash:vDash, imp:vImp, log:vLog, acc:vAcc};
+function spaProgress(r){
+  const list = (S.approvals || []).filter(a => a.request_id === r.id);
+  return SPA_ROLES.map(k => {
+    const a = list.find(x => x.approver_role === k);
+    if (!a) return `<span class="muted">${ROLE[k]} —</span>`;
+    return a.decision === 'approved' ? `${ROLE[k]} ✓` : `${ROLE[k]} ✗`;
+  }).join('<br>');
+}
+function vSpa(){
+  const list = S.requests.filter(r => r.scope === 'spa');
+  if (!list.length) return '<div class="card"><p class="empty">No SPA requests yet.</p></div>';
+  return `<div class="card"><h2>SPA history</h2>${tbl(
+    ['Item','Qty','Purpose','Requested by','Submitted','Status','Approvals','Collected','Returned'],
+    list.map(r => [esc(compName(r.component_id)), r.qty, esc(r.purpose), esc(r.requester_name), fmt(r.created_at),
+      badge(ST[r.status][0], ST[r.status][1]), spaProgress(r),
+      r.collected_at ? fmt(r.collected_at) : '-', r.returned_at ? fmt(r.returned_at) : '-']))}</div>`;
+}
+const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, spa:vSpa, dash:vDash, imp:vImp, log:vLog, acc:vAcc};
 
 function loginView(){
   return `<div class="login"><div class="brand" style="justify-content:center;margin-bottom:18px"><i></i>Component Inventory</div>
@@ -619,6 +644,7 @@ function render(){
   }
   const tabs = [['inv','Inventory'], ['req','New request'], ['my','Requests'],
     ...(APPROVERS.includes(P.role) ? [['appr','Approvals']] : []),
+    ...(['spalead','admin'].includes(P.role) ? [['spa','SPA history']] : []),
     ...(P.role === 'admin' ? [['dash','Dashboard'], ['imp','CSV import'], ['log','Activity'], ['acc','Accounts']] : [])];
   if (!tabs.some(t => t[0] === U.tab)) U.tab = tabs[0][0];
   app.innerHTML = `<header>
