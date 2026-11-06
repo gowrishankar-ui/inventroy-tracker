@@ -30,6 +30,7 @@ th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase}
 .btn{background:var(--brand);color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer;font:inherit;font-weight:600}
 .btn.ghost{background:transparent;color:var(--brand);border:1px solid var(--line)}
 .btn.ok{background:var(--ok)}.btn.bad{background:var(--bad)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
 .btn.sm{padding:4px 9px;font-size:12px}
 input,select,textarea{font:inherit;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:100%}
 label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-weight:600}
@@ -50,16 +51,23 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 <div class="toast" id="toast"></div>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.50.0/dist/umd/supabase.min.js"></script>
 <script>
+/* ================= Configuration ================= */
 const SB = supabase.createClient('https://fbxxyputyvoxczphltlx.supabase.co', 'sb_publishable_hxvllS0csDBvxYqMkafVIw_jwcxs4ZB');
+const FN_URL = 'https://fbxxyputyvoxczphltlx.supabase.co/functions/v1/admin-users';
+const PUB_KEY = 'sb_publishable_hxvllS0csDBvxYqMkafVIw_jwcxs4ZB';
+const STUDENT_DOMAIN = '@protosem.tech';
 const ROLE = {student:'Student', engineer:'Engineer', manager:'Manager', spalead:'SPA Lead', admin:'Engineers-Admin'};
 const CATS = {asset:'Asset', reusable:'Reusable', consumable:'Consumables'};
 const APPROVERS = ['engineer','manager','spalead','admin'];
 const ST = {pending:['Pending','b-warn'], approved:['Approved','b-info'], collected:['Collected','b-ok'], rejected:['Rejected','b-bad']};
+const TEMPLATE = 'Component Name,Specifications,Overall Qty,Working Qty,Damaged Qty,Current Qty,Location,BoQ Type\nArduino Uno R3,ATmega328P board,20,18,2,18,Shelf A1,Asset\nBME280 Sensor,I2C temp and humidity,10,10,0,10,Lab C1,Consumable\n';
 
+/* ================= State ================= */
 let ME = null, P = null, CH = null;
-let S = {components:[], requests:[]};
-let U = {tab:'', q:'', ask:null};
+let S = {components:[], requests:[], logs:[], imports:[], profiles:[]};
+let U = {tab:'', q:'', ask:null, askAcc:null, preview:null, fileName:''};
 
+/* ================= Helpers ================= */
 const v = id => document.getElementById(id).value.trim();
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = t => new Date(t).toLocaleString();
@@ -68,32 +76,48 @@ const tbl = (h, rows) => `<div class="scroll"><table><thead><tr>${h.map(x=>`<th>
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),3000)}
 const scopeBadge = s => s === 'spa' ? badge('SPA','b-info') : badge('Team','b-ok');
 const compName = id => S.components.find(c=>c.id===id)?.name || '(removed)';
-
-// Can the signed-in person approve this request? Mirrors can_approve() in the database.
+const findByName = n => S.components.find(c=>c.name.toLowerCase()===n.toLowerCase());
+const profName = id => S.profiles.find(p=>p.id===id)?.name || 'System';
+// Mirrors can_approve() in the database
 function canDecide(r){
   if (r.status !== 'pending') return false;
   if (P.role === 'admin') return true;
   if (r.scope === 'spa') return r.requester_id !== ME.id && ['engineer','manager','spalead'].includes(P.role);
   return r.approver_role === P.role;
 }
+function normBoq(t){
+  t = (t||'').toLowerCase().trim();
+  if (t.startsWith('asset')) return 'asset';
+  if (t.startsWith('reus') || t.startsWith('resu')) return 'reusable';
+  if (t.startsWith('consum')) return 'consumable';
+  return null;
+}
+async function logMsg(message){
+  if (ME) await SB.from('activity_logs').insert({actor_id: ME.id, message});
+}
 
-/* ---------- Data ---------- */
+/* ================= Data ================= */
 async function loadData(){
-  const [c, r] = await Promise.all([
+  const q = [
     SB.from('components').select('*').order('name'),
     SB.from('requests').select('*').order('created_at', {ascending:false})
-  ]);
-  if (c.error || r.error) return toast('Could not load data: ' + (c.error||r.error).message);
-  S.components = c.data; S.requests = r.data;
-  if (P.role === 'admin') {
-    const p = await SB.from('profiles').select('*').order('email');
-    S.profiles = p.data || [];
-  }
+  ];
+  if (P.role === 'admin') q.push(
+    SB.from('profiles').select('*').order('email'),
+    SB.from('activity_logs').select('*').order('created_at', {ascending:false}).limit(300),
+    SB.from('imports').select('*').order('created_at', {ascending:false}).limit(50)
+  );
+  const res = await Promise.all(q);
+  const err = res.find(x => x.error);
+  if (err) return toast('Could not load data: ' + err.error.message);
+  S.components = res[0].data; S.requests = res[1].data;
+  if (P.role === 'admin'){ S.profiles = res[2].data; S.logs = res[3].data; S.imports = res[4].data; }
   render();
 }
-async function run(promise, okMsg){
+async function run(promise, okMsg, logText){
   const {error} = await promise;
   if (error) return toast(error.message);
+  if (logText) await logMsg(logText);
   if (okMsg) toast(okMsg);
   await loadData();
 }
@@ -107,12 +131,11 @@ async function loadProfile(){
   render();
 }
 
-/* ---------- Sign in / up ---------- */
+/* ================= Sign in / up ================= */
 async function signIn(){
   const {error} = await SB.auth.signInWithPassword({email: v('le'), password: v('lp')});
   if (error) toast(error.message);
 }
-const STUDENT_DOMAIN = '@protosem.tech';
 async function signUp(){
   const email = v('le').toLowerCase();
   if (!email.endsWith(STUDENT_DOMAIN)) return toast('Use your ' + STUDENT_DOMAIN + ' email to create an account. Others need an admin to add them.');
@@ -120,19 +143,18 @@ async function signUp(){
   toast(error ? error.message : 'Account created. Confirm your email, then sign in.');
 }
 async function signOut(){
-  if (CH) { SB.removeChannel(CH); CH = null; }
+  if (CH){ SB.removeChannel(CH); CH = null; }
   await SB.auth.signOut();
 }
 SB.auth.onAuthStateChange((_e, s) => { ME = s?.user || null; P = null; if (ME) loadProfile(); else render(); });
 
-/* ---------- Actions ---------- */
+/* ================= Inventory and requests ================= */
 function addComp(){
-  if (!v('nn')) return toast('Name is required');
-  run(SB.from('components').insert({
-    name: v('nn'), specifications: v('nsp'),
-    overall_qty: +v('no')||0, working_qty: +v('nw')||0, damaged_qty: +v('nd')||0, current_qty: +v('nq')||0,
-    location: v('nl'), boq_type: v('nc')
-  }), 'Component added');
+  const name = v('nn');
+  if (!name) return toast('Name is required');
+  const row = {name, specifications: v('nsp'), overall_qty: +v('no')||0, working_qty: +v('nw')||0,
+    damaged_qty: +v('nd')||0, current_qty: +v('nq')||0, min_qty: +v('nm')||0, location: v('nl'), boq_type: v('nc')};
+  run(SB.from('components').insert(row), 'Component added', `Added new component "${name}" with qty ${row.current_qty}`);
 }
 function receive(){
   const id = v('rcomp'), n = +v('rn');
@@ -140,29 +162,218 @@ function receive(){
   const c = S.components.find(x=>x.id===id);
   run(SB.from('components').update({
     overall_qty: c.overall_qty + n, working_qty: c.working_qty + n, current_qty: c.current_qty + n
-  }).eq('id', id), `Received ${n} unit(s)`);
+  }).eq('id', id), `Received ${n} unit(s)`, `Received ${n} × ${c.name}, new qty ${c.current_qty + n}`);
 }
-function removeComp(id){ U.ask = null; run(SB.from('components').delete().eq('id', id), 'Component removed'); }
+async function removeComp(id){
+  U.ask = null;
+  const c = S.components.find(x=>x.id===id);
+  const {error} = await SB.from('components').delete().eq('id', id);
+  if (error) return toast(error.code === '23503'
+    ? 'This item has requests, so it cannot be removed. Set its quantity to 0 instead.' : error.message);
+  await logMsg(`Removed component "${c?.name}"`);
+  toast('Component removed');
+  await loadData();
+}
 function submitReq(){
   const cid = v('rc'), q = +v('rq'), purpose = v('rp'), scope = v('rs');
   if (!cid || !(q > 0) || !purpose) return toast('Fill in the item, quantity and purpose');
-  run(SB.from('requests').insert({component_id: cid, qty: q, purpose, scope}), 'Request sent for approval');
+  const c = S.components.find(x=>x.id===cid);
   U.tab = 'my';
+  run(SB.from('requests').insert({component_id: cid, qty: q, purpose, scope}), 'Request sent for approval',
+    `${P.name} requested ${q} × ${c?.name} (${scope === 'spa' ? 'SPA' : 'Team'})`);
 }
-function decide(id, dec){ run(SB.rpc('decide_request', {req_id: id, decision: dec, reason: null}), dec === 'approved' ? 'Approved' : 'Rejected'); }
+function decide(id, dec){
+  const reason = dec === 'rejected' ? (v('rr'+id) || null) : null;
+  run(SB.rpc('decide_request', {req_id: id, decision: dec, reason}), dec === 'approved' ? 'Approved' : 'Rejected');
+}
 function collect(id){ run(SB.rpc('collect_request', {req_id: id}), 'Collected, stock updated'); }
 
-/* ---------- Views ---------- */
+/* ================= CSV and PDF import ================= */
+function parseCSV(text){
+  const rows = []; let row = [], cur = '', q = false;
+  for (let i = 0; i < text.length; i++){
+    const ch = text[i];
+    if (q){ if (ch === '"'){ if (text[i+1] === '"'){ cur += '"'; i++; } else q = false; } else cur += ch; }
+    else {
+      if (ch === '"') q = true;
+      else if (ch === ','){ row.push(cur); cur = ''; }
+      else if (ch === '\n'){ row.push(cur); rows.push(row); row = []; cur = ''; }
+      else if (ch !== '\r') cur += ch;
+    }
+  }
+  if (cur || row.length){ row.push(cur); rows.push(row); }
+  return rows.filter(r => r.some(x => x.trim()));
+}
+function buildPreview(rows){
+  const h = rows[0].map(x => x.toLowerCase().replace(/[^a-z]/g, ''));
+  const idx = (...ks) => { for (const k of ks){ const i = h.indexOf(k); if (i >= 0) return i; } return -1; };
+  const col = {name:idx('componentname','name'), spec:idx('specifications','specification','specs'),
+    overall:idx('overallqty','overall'), working:idx('workingqty','working'), damaged:idx('damagedqty','damaged'),
+    current:idx('currentqty','current','qty'), location:idx('location'), category:idx('boqtype','boq','category'), min:idx('minlevel','min')};
+  if (col.name < 0) return toast('Header must include "Component Name"');
+  if (col.current < 0 && col.working < 0 && col.overall < 0) return toast('Header must include a quantity column, e.g. "Current Qty"');
+  U.preview = rows.slice(1).map((r, i) => {
+    const g = k => col[k] >= 0 ? (r[col[k]] || '').trim() : '';
+    const n = k => { const x = parseInt(g(k), 10); return isNaN(x) ? 0 : x; };
+    const name = g('name');
+    const working = col.working >= 0 ? n('working') : n('current');
+    const current = col.current >= 0 ? n('current') : working;
+    const overall = col.overall >= 0 ? n('overall') : working + n('damaged');
+    const damaged = n('damaged');
+    const category = normBoq(g('category'));
+    let err = '';
+    if (!name) err = 'Missing component name';
+    else if (!category) err = 'Unknown BoQ type';
+    else if (current < 0 || working < 0 || damaged < 0 || overall < 0) err = 'Negative quantity';
+    else if (!(current > 0 || working > 0 || overall > 0 || damaged > 0)) err = 'No quantity given';
+    return {line: i+2, name, spec: g('spec'), category, overall, working, damaged, current, min: n('min'), location: g('location'), err};
+  });
+  render();
+}
+function onCSV(input){
+  const f = input.files[0]; if (!f) return;
+  U.fileName = f.name;
+  const isPDF = /\.pdf$/i.test(f.name);
+  const reader = new FileReader();
+  reader.onload = async () => {
+    let text = reader.result;
+    if (isPDF){ try { text = await pdfToCSV(text); } catch(e){ return toast('Could not read PDF: ' + e.message); } }
+    const rows = parseCSV(text);
+    if (rows.length < 2) return toast('File needs a header row and at least one item');
+    buildPreview(rows);
+  };
+  if (isPDF) reader.readAsArrayBuffer(f); else reader.readAsText(f);
+}
+let PDFJS = null;
+function loadPdfJs(){
+  if (PDFJS) return Promise.resolve(PDFJS);
+  const base = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = base + 'pdf.min.js';
+    s.onload = () => { PDFJS = window.pdfjsLib; PDFJS.GlobalWorkerOptions.workerSrc = base + 'pdf.worker.min.js'; res(PDFJS); };
+    s.onerror = () => rej(new Error('PDF reader could not be loaded'));
+    document.head.appendChild(s);
+  });
+}
+// Reads every table in the PDF and returns CSV text in the platform's column order
+async function pdfToCSV(buf){
+  const lib = await loadPdfJs();
+  const pdf = await lib.getDocument({data: buf}).promise;
+  const HEAD = ['Component Name','Specifications','Overall Qty','Working Qty','Damaged Qty','Current Qty','Location','BoQ Type'];
+  const KEYS = ['componentname','specifications','overallqty','workingqty','damagedqty','currentqty','location','boqtype'];
+  const out = [HEAD]; let map = null;
+  for (let p = 1; p <= pdf.numPages; p++){
+    const tc = await (await pdf.getPage(p)).getTextContent();
+    const items = tc.items.filter(i => i.str.trim()).map(i => ({s: i.str.trim(), x: i.transform[4], y: Math.round(i.transform[5]), w: i.width || 0}));
+    const lines = [];
+    items.forEach(it => { const L = lines.find(l => Math.abs(l.y - it.y) <= 2); if (L) L.items.push(it); else lines.push({y: it.y, items: [it]}); });
+    lines.sort((a, b) => b.y - a.y);
+    for (const L of lines){
+      L.items.sort((a, b) => a.x - b.x);
+      const cells = []; let prevEnd = null;
+      L.items.forEach(it => { const gap = prevEnd === null ? Infinity : it.x - prevEnd; if (gap < 8 && cells.length) cells[cells.length-1] += ' ' + it.s; else cells.push(it.s); prevEnd = it.x + it.w; });
+      const norm = cells.map(c => c.toLowerCase().replace(/[^a-z]/g, ''));
+      if (norm.includes('componentname')){ map = KEYS.map(k => norm.indexOf(k)); continue; }
+      if (!map || cells.length < 2) continue;
+      const row = map.map(i => i >= 0 ? (cells[i] || '') : '');
+      if (!row.some(x => x)) continue;
+      out.push(row);
+    }
+  }
+  if (!map) throw new Error('no table with a "Component Name" header row was found');
+  const esc2 = x => /[",\n]/.test(x) ? '"' + x.replace(/"/g, '""') + '"' : x;
+  return out.map(r => r.map(esc2).join(',')).join('\n');
+}
+async function commitImport(){
+  const valid = U.preview.filter(p => !p.err);
+  const replace = !!document.getElementById('rep')?.checked;
+  let added = 0, restocked = 0, failed = 0, removed = 0;
+  // Merge rows that share a name (the same as the restock rule: quantities add up)
+  const groups = new Map();
+  valid.forEach(p => {
+    const k = p.name.toLowerCase(), g = groups.get(k);
+    if (!g) groups.set(k, {...p});
+    else { g.overall += p.overall; g.working += p.working; g.damaged += p.damaged; g.current += p.current;
+      g.location = g.location || p.location; g.spec = g.spec || p.spec; g.min = g.min || p.min; }
+  });
+  // Replace mode: remove components that are not in the file. Items with requests are kept (history).
+  if (replace){
+    for (const c of S.components.filter(c => !groups.has(c.name.toLowerCase()))){
+      const {error} = await SB.from('components').delete().eq('id', c.id);
+      if (!error) removed++;
+    }
+  }
+  for (const p of groups.values()){
+    const m = findByName(p.name);
+    let res;
+    if (m){
+      const upd = replace
+        ? {overall_qty: p.overall, working_qty: p.working, damaged_qty: p.damaged, current_qty: p.current}
+        : {overall_qty: m.overall_qty + p.overall, working_qty: m.working_qty + p.working,
+           damaged_qty: m.damaged_qty + p.damaged, current_qty: m.current_qty + p.current};
+      if (p.location) upd.location = p.location;
+      if (p.min) upd.min_qty = p.min;
+      if (p.spec) upd.specifications = p.spec;
+      upd.boq_type = p.category;
+      res = await SB.from('components').update(upd).eq('id', m.id);
+      if (!res.error) restocked++;
+    } else {
+      res = await SB.from('components').insert({name: p.name, specifications: p.spec, overall_qty: p.overall,
+        working_qty: p.working, damaged_qty: p.damaged, current_qty: p.current, min_qty: p.min,
+        location: p.location, boq_type: p.category});
+      if (!res.error) added++;
+    }
+    if (res.error) failed++;
+  }
+  const skipped = U.preview.length - valid.length + failed;
+  await SB.from('imports').insert({imported_by: ME.id, file_name: U.fileName, added, restocked, skipped});
+  await logMsg(`CSV "${U.fileName}" processed: ${added} new, ${restocked} restocked, ${skipped} skipped` +
+    (replace ? `, ${removed} removed (opening stock replaced)` : ''));
+  U.preview = null;
+  toast(`Import done: ${added} new, ${restocked} restocked`);
+  U.tab = 'log';
+  await loadData();
+}
+
+/* ================= Accounts (admin only, through the Edge Function) ================= */
+async function acctCall(body){
+  const {data:{session}} = await SB.auth.getSession();
+  const res = await fetch(FN_URL, {method:'POST',
+    headers:{Authorization:'Bearer ' + session.access_token, apikey: PUB_KEY, 'Content-Type':'application/json'},
+    body: JSON.stringify(body)});
+  const out = await res.json().catch(() => ({error:'No response from server'}));
+  if (!res.ok || out.error){ toast(out.error || 'Request failed'); return false; }
+  return true;
+}
+async function createAccount(){
+  const email = v('ae').toLowerCase(), pw = v('ap'), name = v('an'), role = v('ar');
+  if (!email || pw.length < 8) return toast('Email and a password of 8+ characters are required');
+  if (await acctCall({action:'create', email, password: pw, name, role})){ toast('Account created'); await loadData(); }
+}
+async function setRole(id, role){
+  if (await acctCall({action:'set_role', id, role: role === 'none' ? null : role})){ toast('Access updated'); await loadData(); }
+}
+async function removeAccount(id){
+  U.askAcc = null;
+  if (await acctCall({action:'remove', id})){ toast('Account removed'); await loadData(); }
+}
+
+/* ================= Views ================= */
 function invBody(){
   const q = U.q.toLowerCase(), adm = P.role === 'admin';
-  const list = S.components.filter(c => (c.name+' '+c.location+' '+c.specifications).toLowerCase().includes(q));
+  const list = S.components.filter(c => (c.name + ' ' + c.location + ' ' + (c.specifications||'')).toLowerCase().includes(q));
   if (!list.length) return '<p class="empty">No components match.</p>';
   return tbl(['Component','Specifications','Overall','Working','Damaged','Current','Location','BoQ Type', adm ? 'Admin' : ''],
-    list.map(c => [esc(c.name), esc(c.specifications||'-'), c.overall_qty, c.working_qty, c.damaged_qty,
+    list.map(c => [esc(c.name), esc(c.specifications || '-'), c.overall_qty, c.working_qty, c.damaged_qty,
       `<b>${c.current_qty}</b>`, esc(c.location), badge(CATS[c.boq_type], 'b-info'),
       adm ? (U.ask === c.id
-        ? `<button class="btn bad sm" onclick="removeComp('${c.id}')">Confirm</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
-        : `<button class="btn ghost sm" onclick="U.ask='${c.id}';render()">Remove</button>`) : '']));
+        ? `<button class="btn bad sm" onclick="removeComp('${c.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
+        : `<button class="btn ghost sm" onclick="receiveFocus('${c.id}')">+ Receive</button> <button class="btn bad sm" onclick="U.ask='${c.id}';render()">Remove</button>`) : '']));
+}
+function receiveFocus(id){
+  const sel = document.getElementById('rcomp');
+  if (sel){ sel.value = id; sel.scrollIntoView({behavior:'smooth', block:'center'}); }
 }
 function vInv(){
   const adm = P.role === 'admin';
@@ -174,6 +385,7 @@ function vInv(){
       <div><label>Working Qty</label><input id="nw" type="number" min="0" value="0"></div>
       <div><label>Damaged Qty</label><input id="nd" type="number" min="0" value="0"></div>
       <div><label>Current Qty</label><input id="nq" type="number" min="0" value="0"></div>
+      <div><label>Min level</label><input id="nm" type="number" min="0" value="0"></div>
       <div><label>Location</label><input id="nl"></div>
       <div><label>BoQ Type</label><select id="nc">${Object.entries(CATS).map(([k,x])=>`<option value="${k}">${x}</option>`).join('')}</select></div>
       <div><button class="btn" onclick="addComp()">Add</button></div>
@@ -192,7 +404,7 @@ function vInv(){
     <div id="invbody">${invBody()}</div></div>`;
 }
 function vReq(){
-  const hint = ['student'].includes(P.role)
+  const hint = P.role === 'student'
     ? 'Team items go to an Engineer. SPA items go to an Engineer, Manager, SPA Lead or Admin.'
     : 'Team items go to the Engineers-Admin. SPA items go to an Engineer, Manager, SPA Lead or Admin.';
   return `<div class="card" style="max-width:640px"><h2>Request a component</h2>
@@ -214,17 +426,18 @@ function vMy(){
     list.map(r => [esc(compName(r.component_id)), r.qty, esc(r.purpose), scopeBadge(r.scope),
       esc(r.requester_name), fmt(r.created_at), badge(ST[r.status][0], ST[r.status][1]),
       r.status === 'approved' && (adm || r.requester_id === ME.id)
-        ? `<button class="btn ok sm" onclick="collect('${r.id}')">Mark collected</button>` : ''])
-  )}</div>`;
+        ? `<button class="btn ok sm" onclick="collect('${r.id}')">Mark collected</button>` : '']))}</div>`;
 }
 function vAppr(){
   const list = S.requests.filter(canDecide);
   if (!list.length) return '<div class="card"><p class="empty">No requests waiting for your approval.</p></div>';
   return `<div class="card"><h2>Pending approvals</h2>${tbl(
     ['Requester','Role','Item','Qty','Purpose','Used for','Submitted','Decision'],
-    list.map(r => [esc(r.requester_name), ROLE[r.requester_role]||'', esc(compName(r.component_id)), r.qty,
+    list.map(r => [esc(r.requester_name), ROLE[r.requester_role] || '', esc(compName(r.component_id)), r.qty,
       esc(r.purpose), scopeBadge(r.scope), fmt(r.created_at),
-      `<button class="btn ok sm" onclick="decide('${r.id}','approved')">Approve</button> <button class="btn bad sm" onclick="decide('${r.id}','rejected')">Reject</button>`])
+      `<button class="btn ok sm" onclick="decide('${r.id}','approved')">Approve</button>
+       <input id="rr${r.id}" placeholder="Reason (optional)" style="max-width:160px;display:inline-block;padding:4px 8px">
+       <button class="btn bad sm" onclick="decide('${r.id}','rejected')">Reject</button>`])
   )}</div>`;
 }
 function vDash(){
@@ -235,63 +448,75 @@ function vDash(){
     ['Team',     ...grp(r => r.scope !== 'spa' && r.requester_role !== 'student')],
     ['SPA',      ...grp(r => r.scope === 'spa')]
   ];
-  const units = S.components.reduce((a,c)=>a+c.current_qty,0);
+  const low = S.components.filter(c => c.current_qty <= c.min_qty);
+  const units = S.components.reduce((a,c) => a + c.current_qty, 0);
   const pending = S.requests.filter(r => r.status === 'pending').length;
   return `<div class="grid stats" style="margin-bottom:16px">
-    <div class="card stat"><span>Components</span><b>${S.components.length}</b></div>
-    <div class="card stat"><span>Units available</span><b>${units}</b></div>
-    <div class="card stat"><span>Pending approvals</span><b>${pending}</b></div>
-  </div>
-  <div class="card"><h2>Utilisation (collected)</h2>${tbl(['Group','Requests collected','Units collected'], util)}</div>`;
+      <div class="card stat"><span>Components</span><b>${S.components.length}</b></div>
+      <div class="card stat"><span>Units in stock</span><b>${units}</b></div>
+      <div class="card stat"><span>Low stock</span><b>${low.length}</b></div>
+      <div class="card stat"><span>Pending approvals</span><b>${pending}</b></div>
+    </div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(340px,1fr))">
+      <div class="card"><h2>Low stock alerts</h2>${low.length
+        ? tbl(['Item','Current','Min'], low.map(c => [esc(c.name), badge(c.current_qty, 'b-bad'), c.min_qty]))
+        : '<p class="empty">All items are above minimum.</p>'}</div>
+      <div class="card"><h2>Recent CSV imports</h2>${S.imports.length
+        ? tbl(['When','By','New','Restocked'], S.imports.slice(0,6).map(i => [fmt(i.created_at), esc(profName(i.imported_by)), i.added, i.restocked]))
+        : '<p class="empty">No imports yet.</p>'}</div>
+      <div class="card"><h2>Utilisation (collected)</h2>${tbl(['Group','Requests collected','Units collected'], util)}</div>
+    </div>`;
 }
-/* ---------- Accounts (admin only, via Edge Function) ---------- */
-const FN_URL = 'https://fbxxyputyvoxczphltlx.supabase.co/functions/v1/admin-users';
-const PUB_KEY = 'sb_publishable_hxvllS0csDBvxYqMkafVIw_jwcxs4ZB';
-async function acctCall(body){
-  const {data:{session}} = await SB.auth.getSession();
-  const res = await fetch(FN_URL, {method:'POST',
-    headers:{Authorization:'Bearer '+session.access_token, apikey:PUB_KEY, 'Content-Type':'application/json'},
-    body:JSON.stringify(body)});
-  const out = await res.json().catch(()=>({error:'No response from server'}));
-  if (!res.ok || out.error) { toast(out.error || 'Request failed'); return false; }
-  return true;
+function vImp(){
+  const p = U.preview; let preview = '';
+  if (p){
+    const valid = p.filter(x => !x.err).length;
+    preview = `<div style="margin-top:18px"><h2>Preview (${p.length} rows)</h2>${tbl(
+      ['Line','Item','Specifications','BoQ Type','Overall','Working','Damaged','Current','Action','Issue'],
+      p.map(x => [x.line, esc(x.name), esc(x.spec), x.category ? badge(CATS[x.category], 'b-info') : '-',
+        x.overall, x.working, x.damaged, x.current,
+        x.err ? badge('Error', 'b-bad') : (findByName(x.name) ? badge('Restock +' + x.current, 'b-warn') : badge('New item', 'b-ok')),
+        esc(x.err)]))}
+      <label style="display:flex;gap:8px;align-items:center;margin-top:12px;font-weight:600;color:var(--ink)">
+        <input type="checkbox" id="rep" style="width:auto"> Replace current stock with this file (first full load of your sheet)</label>
+      <div class="row" style="margin-top:14px">
+        <button class="btn" ${valid ? '' : 'disabled'} onclick="commitImport()">Import ${valid} valid row${valid===1?'':'s'}</button>
+        <button class="btn ghost" onclick="U.preview=null;render()">Cancel</button>
+      </div></div>`;
+  }
+  return `<div class="card" style="max-width:900px"><h2>Import purchased components (CSV or PDF)</h2>
+    <p class="muted">Columns: <b>Component Name, Specifications, Overall Qty, Working Qty, Damaged Qty, Current Qty, Location, BoQ Type</b>. BoQ Type is Asset, Reusable or Consumables. Rows matching an existing component name add to its quantities; other rows create new items.</p>
+    <p><a href="data:text/csv;charset=utf-8,${encodeURIComponent(TEMPLATE)}" download="inventory-template.csv" style="color:var(--brand)">Download template</a></p>
+    <input type="file" accept=".csv,.pdf,text/csv,application/pdf" onchange="onCSV(this)">${preview}</div>`;
 }
-async function createAccount(){
-  const email = v('ae').toLowerCase(), pw = v('ap'), name = v('an'), role = v('ar');
-  if (!email || pw.length < 8) return toast('Email and a password of 8+ characters are required');
-  if (await acctCall({action:'create', email, password:pw, name, role})) { toast('Account created'); await loadData(); }
-}
-async function setRole(id, role){
-  if (await acctCall({action:'set_role', id, role: role === 'none' ? null : role})) { toast('Access updated'); await loadData(); }
-}
-async function removeAccount(id){
-  U.ask = null;
-  if (await acctCall({action:'remove', id})) { toast('Account removed'); await loadData(); }
+function vLog(){
+  return `<div class="card"><h2>Activity</h2>${tbl(['Time','By','Event'],
+    S.logs.slice(0,300).map(l => [fmt(l.created_at), esc(profName(l.actor_id)), esc(l.message)]))}</div>`;
 }
 function vAcc(){
   const opts = sel => [['none','No access'], ...Object.entries(ROLE)]
-    .map(([k,l]) => `<option value="${k}" ${(sel||'none')===k?'selected':''}>${l}</option>`).join('');
-  const rows = (S.profiles||[]).map(p => [
+    .map(([k,l]) => `<option value="${k}" ${(sel || 'none') === k ? 'selected' : ''}>${l}</option>`).join('');
+  const rows = S.profiles.map(p => [
     esc(p.email), esc(p.name),
     p.id === ME.id ? '<span class="muted">you</span>'
       : `<select onchange="setRole('${p.id}',this.value)">${opts(p.role)}</select>`,
-    p.id === ME.id ? '' : (U.ask === p.id
-      ? `<button class="btn bad sm" onclick="removeAccount('${p.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
-      : `<button class="btn ghost sm" onclick="U.ask='${p.id}';render()">Remove</button>`)
+    p.id === ME.id ? '' : (U.askAcc === p.id
+      ? `<button class="btn bad sm" onclick="removeAccount('${p.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.askAcc=null;render()">Cancel</button>`
+      : `<button class="btn ghost sm" onclick="U.askAcc='${p.id}';render()">Remove</button>`)
   ]);
   return `<div class="card" style="margin-bottom:16px"><h2>Add account</h2>
-    <div class="form">
-      <div><label>Email</label><input id="ae" type="email"></div>
-      <div><label>Name</label><input id="an"></div>
-      <div><label>Role</label><select id="ar">${opts('student')}</select></div>
-      <div><label>Temporary password (8+ characters)</label><input id="ap" type="password"></div>
-      <div><button class="btn" onclick="createAccount()">Create account</button></div>
+      <div class="form">
+        <div><label>Email</label><input id="ae" type="email"></div>
+        <div><label>Name</label><input id="an"></div>
+        <div><label>Role</label><select id="ar">${opts('student')}</select></div>
+        <div><label>Temporary password (8+ characters)</label><input id="ap" type="password"></div>
+        <div><button class="btn" onclick="createAccount()">Create account</button></div>
+      </div>
+      <p class="muted" style="margin:10px 0 0">Give the person their password. Choose "No access" to block someone without deleting their history.</p>
     </div>
-    <p class="muted" style="margin:10px 0 0">Give the person their password. Choose "No access" to block someone without deleting their history.</p>
-  </div>
-  <div class="card"><h2>Accounts</h2>${tbl(['Email','Name','Role','Remove'], rows)}</div>`;
+    <div class="card"><h2>Accounts</h2>${tbl(['Email','Name','Role','Remove'], rows)}</div>`;
 }
-const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, dash:vDash, acc:vAcc};
+const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, dash:vDash, imp:vImp, log:vLog, acc:vAcc};
 
 function loginView(){
   return `<div class="login"><div class="brand" style="justify-content:center;margin-bottom:18px"><i></i>Component Inventory</div>
@@ -301,14 +526,14 @@ function loginView(){
       <div><label>Password</label><input id="lp" type="password"></div>
       <div><label>Name (for new accounts)</label><input id="ln"></div>
       <div class="row"><button class="btn" onclick="signIn()">Sign in</button><button class="btn ghost" onclick="signUp()">Create account</button></div>
-      <p class="muted" style="margin:0">Students: use your protosem.tech email to create an account.</p>
+      <p class="muted" style="margin:0">Students: use your ${STUDENT_DOMAIN} email to create an account.</p>
     </div></div>`;
 }
 function render(){
   const app = document.getElementById('app');
-  if (!ME) { app.innerHTML = loginView(); return; }
-  if (!P)  { app.innerHTML = '<p class="empty">Loading…</p>'; return; }
-  if (!P.role) {
+  if (!ME){ app.innerHTML = loginView(); return; }
+  if (!P){ app.innerHTML = '<p class="empty">Loading…</p>'; return; }
+  if (!P.role){
     app.innerHTML = `<div class="login"><div class="card"><h2>Access not granted</h2>
       <p class="muted">${esc(P.email)} has no role yet. Ask the Engineers-Admin to set it.</p>
       <button class="btn ghost" onclick="signOut()">Sign out</button></div></div>`;
@@ -316,7 +541,7 @@ function render(){
   }
   const tabs = [['inv','Inventory'], ['req','New request'], ['my','Requests'],
     ...(APPROVERS.includes(P.role) ? [['appr','Approvals']] : []),
-    ...(P.role === 'admin' ? [['dash','Dashboard'], ['acc','Accounts']] : [])];
+    ...(P.role === 'admin' ? [['dash','Dashboard'], ['imp','CSV import'], ['log','Activity'], ['acc','Accounts']] : [])];
   if (!tabs.some(t => t[0] === U.tab)) U.tab = tabs[0][0];
   app.innerHTML = `<header>
       <div class="brand"><i></i>Component Inventory</div>
