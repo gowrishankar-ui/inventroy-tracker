@@ -112,8 +112,10 @@ async function signIn(){
   const {error} = await SB.auth.signInWithPassword({email: v('le'), password: v('lp')});
   if (error) toast(error.message);
 }
+const STUDENT_DOMAIN = '@protosem.tech';
 async function signUp(){
-  const email = v('le');
+  const email = v('le').toLowerCase();
+  if (!email.endsWith(STUDENT_DOMAIN)) return toast('Use your ' + STUDENT_DOMAIN + ' email to create an account. Others need an admin to add them.');
   const {error} = await SB.auth.signUp({email, password: v('lp'), options:{data:{name: v('ln') || email.split('@')[0]}}});
   toast(error ? error.message : 'Account created. Confirm your email, then sign in.');
 }
