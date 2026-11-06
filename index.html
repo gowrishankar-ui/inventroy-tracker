@@ -377,12 +377,13 @@ async function createAccount(){
   if (await acctCall({action:'create', email, password: pw, name, role})){ toast('Account created'); await loadData(); }
 }
 async function setRole(id, role){
-  const out = await acctCall({action:'set_role', id, role: role === 'none' ? null : role});
-  if (!out) return;
-  // Show the role the database actually saved, straight away
+  blurNow();
+  const {data, error} = await SB.rpc('set_user_role', {target: id, new_role: role === 'none' ? null : role});
+  if (error) return toast(error.message);
+  const saved = data === 'none' ? null : data;       // the role the database stored
   const p = S.profiles.find(x => x.id === id);
-  if (p) p.role = out.role;
-  toast('Saved: ' + (p?.email || 'account') + ' is now ' + (out.role ? ROLE[out.role] : 'No access'));
+  if (p) p.role = saved;
+  toast('Saved: ' + (p?.email || 'account') + ' is now ' + (saved ? ROLE[saved] : 'No access'));
   render();
   loadData(true);
 }
