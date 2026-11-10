@@ -44,6 +44,14 @@ label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;font-wei
 .toast{position:fixed;bottom:20px;right:20px;background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;opacity:0;transition:.3s;pointer-events:none;max-width:90vw}
 .toast.show{opacity:1}
 @media (max-width:640px){main{padding:14px}header{padding:12px 14px}}
+
+/* Searchable drop-down with animation */
+.cb{position:relative;flex:2;min-width:200px}
+.cb-panel{position:absolute;top:100%;left:0;right:0;max-height:240px;overflow:auto;margin-top:4px;background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 28px rgba(0,0,0,.18);z-index:20;opacity:0;transform:translateY(-8px) scale(.98);transform-origin:top;pointer-events:none;transition:opacity .18s ease,transform .18s ease}
+.cb.open .cb-panel{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
+.cb-opt{padding:9px 12px;cursor:pointer;transition:background .12s ease}
+.cb-opt:hover{background:var(--brand-2)}
+.cb-empty{padding:9px 12px;color:var(--muted)}
 </style>
 </head>
 <body>
@@ -65,7 +73,7 @@ const TEMPLATE = 'Component Name,Specifications,Overall Qty,Working Qty,Damaged 
 /* ================= State ================= */
 let ME = null, P = null, CH = null;
 let S = {components:[], requests:[], logs:[], imports:[], profiles:[], notes:[], approvals:[]};
-let POLL = null, TICK = 0, DIRTY = false;
+let POLL = null, TICK = 0, DIRTY = false, LAST_SIG = '', AUTH_READY = false;
 let U = {tab:'', q:'', ask:null, askAcc:null, preview:null, fileName:''};
 
 /* ================= Helpers ================= */
@@ -102,23 +110,28 @@ async function logMsg(message){
 
 /* ================= Data ================= */
 async function loadData(full){
+  const adminOn = P.role === 'admin' && ['log','acc','dash','imp'].includes(U.tab);
+  const adminExtra = adminOn && (full || TICK % 4 === 0);
   const q = [
     SB.from('components').select('*').order('name'),
-    SB.from('requests').select('*').order('created_at', {ascending:false}),
+    SB.from('requests').select('*').order('created_at', {ascending:true}),
     SB.from('notifications').select('*').order('created_at', {ascending:false}).limit(50),
     SB.from('approvals').select('*')
   ];
-  const adminExtra = P.role === 'admin' && (full || TICK % 4 === 0);
   if (adminExtra) q.push(
     SB.from('profiles').select('*').order('email'),
-    SB.from('activity_logs').select('*').order('created_at', {ascending:false}).limit(300),
-    SB.from('imports').select('*').order('created_at', {ascending:false}).limit(50)
+    SB.from('activity_logs').select('*').order('created_at', {ascending:false}).limit(200),
+    SB.from('imports').select('*').order('created_at', {ascending:false}).limit(50),
+    SB.from('damage_reports').select('*').order('created_at', {ascending:false}).limit(200)
   );
   const res = await Promise.all(q);
   const err = res.find(x => x.error);
   if (err) return toast('Could not load data: ' + err.error.message);
+  const sig = JSON.stringify(res.map(x => x.data));
+  if (sig === LAST_SIG) return;                 // nothing changed: do not redraw the screen
+  LAST_SIG = sig;
   S.components = res[0].data; S.requests = res[1].data; S.notes = res[2].data; S.approvals = res[3].data;
-  if (adminExtra){ S.profiles = res[4].data; S.logs = res[5].data; S.imports = res[6].data; }
+  if (adminExtra){ S.profiles = res[4].data; S.logs = res[5].data; S.imports = res[6].data; S.damage = res[7].data; }
   paint();
 }
 // Do not redraw while someone is typing in a form; redraw as soon as they leave the field
@@ -168,7 +181,13 @@ async function signOut(){
   if (POLL){ clearInterval(POLL); POLL = null; }
   await SB.auth.signOut();
 }
-SB.auth.onAuthStateChange((_e, s) => { ME = s?.user || null; P = null; if (ME) loadProfile(); else render(); });
+SB.auth.onAuthStateChange((_e, s) => {
+  AUTH_READY = true;
+  const user = s?.user || null;
+  if (user && P && user.id === ME?.id){ ME = user; return; }   // same person: nothing to reload
+  ME = user; P = null; LAST_SIG = '';
+  if (ME) loadProfile(); else render();
+});
 
 /* ================= Inventory and requests ================= */
 function addComp(){
@@ -196,13 +215,30 @@ async function removeComp(id){
   toast('Component removed');
   await loadData();
 }
-function submitReq(){
-  const cid = v('rc'), q = +v('rq'), purpose = v('rp'), scope = v('rs');
-  if (!cid || !(q > 0) || !purpose) return toast('Fill in the item, quantity and purpose');
-  const c = S.components.find(x=>x.id===cid);
+async function submitReq(){
+  const d = U.draft;
+  const used = USED.find(([k]) => k === d.used) || USED[1];
+  const lines = d.lines.filter(l => l.cid && l.qty > 0);
+  if (!lines.length) return toast('Choose at least one component and a quantity');
+  for (const l of lines){
+    const c = S.components.find(x => x.id === l.cid);
+    if (c && l.qty > c.current_qty) return toast('Only ' + c.current_qty + ' available for ' + c.name);
+  }
+  if (!d.title.trim()) return toast('Enter the project title');
+  if (!d.purpose.trim()) return toast('Describe the purpose');
+  blurNow();
+  const rows = lines.map(l => ({component_id: l.cid, qty: +l.qty, purpose: d.purpose.trim(),
+    scope: used[1], project_title: d.title.trim(), used_for: used[0]}));
+  const {error} = await SB.from('requests').insert(rows);
+  if (error) return toast(error.message);
+  for (const l of lines){
+    const c = S.components.find(x => x.id === l.cid);
+    await logMsg(`${P.name} requested ${l.qty} x ${c?.name} (${used[0]}) for "${d.title.trim()}"`);
+  }
+  U.draft = blankDraft();
   U.tab = 'my';
-  run(SB.from('requests').insert({component_id: cid, qty: q, purpose, scope}), 'Request sent for approval',
-    `${P.name} requested ${q} × ${c?.name} (${scope === 'spa' ? 'SPA' : 'Team'})`);
+  toast('Request sent for approval');
+  await loadData(true);
 }
 async function decide(id, dec){
   blurNow();
@@ -407,8 +443,8 @@ function invBody(){
     list.map(c => [esc(c.name), esc(c.specifications || '-'), c.overall_qty, c.working_qty, c.damaged_qty,
       `<b>${c.current_qty}</b>`, esc(c.location), badge(CATS[c.boq_type], 'b-info'),
       adm ? (U.ask === c.id
-        ? `<button class="btn bad sm" onclick="removeComp('${c.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
-        : `<button class="btn ghost sm" onclick="receiveFocus('${c.id}')">+ Receive</button> <button class="btn bad sm" onclick="U.ask='${c.id}';render()">Remove</button>`) : '']));
+        ? `<button class="btn bad sm" onclick="ask('Remove this component from the inventory?', () => removeComp('${c.id}'))">Confirm remove</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
+        : `<button class="btn ghost sm" onclick="receiveFocus('${c.id}')">+ Receive</button> <button class="btn bad sm" onclick="ask('Remove this component from the inventory?', () => removeComp('${c.id}'))">Remove</button>`) : '']));
 }
 function receiveFocus(id){
   const sel = document.getElementById('rcomp');
@@ -427,12 +463,12 @@ function vInv(){
       <div><label>Min level</label><input id="nm" type="number" min="0" value="0"></div>
       <div><label>Location</label><input id="nl"></div>
       <div><label>BoQ Type</label><select id="nc">${Object.entries(CATS).map(([k,x])=>`<option value="${k}">${x}</option>`).join('')}</select></div>
-      <div><button class="btn" onclick="addComp()">Add</button></div>
+      <div><button class="btn" onclick="ask('Add this component to the inventory?', () => addComp())">Add</button></div>
     </div></div>
     <div class="card" style="margin-bottom:16px"><h2>Receive stock</h2><div class="form">
       <div><label>Component</label><select id="rcomp">${S.components.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
       <div><label>Units received</label><input id="rn" type="number" min="1" value="1"></div>
-      <div><button class="btn" onclick="receive()">Add to stock</button></div>
+      <div><button class="btn" onclick="ask('Add these units to stock?', () => receive())">Add to stock</button></div>
     </div></div>`;
   return `${form}<div class="card">
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
@@ -442,28 +478,99 @@ function vInv(){
     </div>
     <div id="invbody">${invBody()}</div></div>`;
 }
+const USED = [['SPA','spa'],['Protosem PoC','team'],['Protosem Activity','team'],['Self learning','team']];
+const blankDraft = () => ({title:'', purpose:'', used:'Protosem PoC', search:'', lines:[{cid:'', qty:1}]});
+function setLineQty(i, val){
+  const l = U.draft.lines[i];
+  const c = S.components.find(x => x.id === l.cid);
+  let q = Math.floor(+val) || 1;
+  if (c && q > c.current_qty){ toast('Only ' + c.current_qty + ' available for ' + c.name); q = c.current_qty; }
+  if (q < 1) q = 1;
+  l.qty = q;
+  linesRedraw();
+}
+function linesHtml(){
+  const d = U.draft;
+  return d.lines.map((l, i) => {
+    const c = S.components.find(x => x.id === l.cid);
+    return `<div class="row" style="margin-bottom:8px">
+      <div class="cb" id="cb${i}">
+        <input id="cbin${i}" autocomplete="off" placeholder="Type to search components" value="${esc(c ? c.name + ' (' + c.current_qty + ' available)' : '')}"
+          oninput="cbFilter(${i}, this.value)" onfocus="cbFilter(${i}, '')"
+          onblur="setTimeout(() => cbClose(${i}), 150)"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();cbEnter(${i})}">
+        <div class="cb-panel" id="cbp${i}">${cbPanel(i, '')}</div>
+      </div>
+      <input type="number" min="1" max="${c ? c.current_qty : 0}" value="${l.qty}" style="flex:1" title="${c ? 'Available: ' + c.current_qty : 'Choose a component first'}" onchange="setLineQty(${i}, this.value)">
+      ${d.lines.length > 1 ? `<button class="btn ghost sm" onclick="U.draft.lines.splice(${i},1);linesRedraw()">Remove</button>` : ''}
+    </div>`;
+  }).join('');
+}
+function cbMatches(q){
+  q = (q || '').trim().toLowerCase();
+  return S.components.filter(c => !q || (c.name + ' ' + (c.specifications || '')).toLowerCase().includes(q));
+}
+function cbPanel(i, q){
+  const list = cbMatches(q);
+  return list.length
+    ? list.map(c => `<div class="cb-opt" onmousedown="event.preventDefault();cbPick(${i}, '${c.id}')">${esc(c.name)} <span class="muted">· ${c.current_qty} available</span></div>`).join('')
+    : '<div class="cb-empty">No component matches</div>';
+}
+function cbFilter(i, q){
+  const p = document.getElementById('cbp' + i);
+  if (p) p.innerHTML = cbPanel(i, q);
+  document.getElementById('cb' + i)?.classList.add('open');
+}
+function cbPick(i, id){
+  const c = S.components.find(x => x.id === id);
+  U.draft.lines[i].cid = id;
+  const input = document.getElementById('cbin' + i);
+  if (input) input.value = c ? c.name + ' (' + c.current_qty + ' available)' : '';
+  document.getElementById('cb' + i)?.classList.remove('open');
+}
+function cbEnter(i){
+  const first = cbMatches(document.getElementById('cbin' + i).value)[0];
+  if (first) cbPick(i, first.id);
+}
+function cbClose(i){
+  const l = U.draft.lines[i];
+  const c = l && S.components.find(x => x.id === l.cid);
+  const input = document.getElementById('cbin' + i);
+  if (input) input.value = c ? c.name + ' (' + c.current_qty + ' available)' : '';
+  document.getElementById('cb' + i)?.classList.remove('open');
+}
+function setLineComp(i, name){
+  const c = S.components.find(x => x.name.toLowerCase() === name.trim().toLowerCase());
+  if (!c){ toast('Pick a component from the suggestions'); return linesRedraw(); }
+  U.draft.lines[i].cid = c.id;
+  linesRedraw();
+}
+function linesRedraw(){ const el = document.getElementById('lines'); if (el) el.innerHTML = linesHtml(); }
 function vReq(){
+  U.draft = U.draft || blankDraft();
+  const d = U.draft;
   const hint = P.role === 'student'
-    ? 'Team items go to an Engineer. SPA items go to an Engineer, Manager, SPA Lead or Admin.'
-    : 'Team items go to the Engineers-Admin. SPA items go to an Engineer, Manager, SPA Lead or Admin.';
-  return `<div class="card" style="max-width:640px"><h2>Request a component</h2>
+    ? 'Team items go to an Engineer. SPA items need approval from an Engineer, Manager, SPA Lead and Engineers-Admin.'
+    : 'Team items go to the Engineers-Admin. SPA items need approval from an Engineer, Manager, SPA Lead and Engineers-Admin.';
+  return `<div class="card" style="max-width:720px"><h2>Request a component</h2>
     <p class="muted" style="margin-top:-8px">${hint}</p>
     <div class="grid">
-      <div><label>Component</label><select id="rc">${S.components.map(c=>`<option value="${c.id}">${esc(c.name)}, ${c.current_qty} available</option>`).join('')}</select></div>
-      <div><label>Used for</label><select id="rs"><option value="team">Team project</option><option value="spa">SPA (product development)</option></select></div>
-      <div><label>Quantity</label><input id="rq" type="number" min="1" value="1"></div>
-      <div><label>Purpose / project</label><textarea id="rp" rows="3"></textarea></div>
+      <div><label>Used for</label><select onchange="U.draft.used=this.value">${USED.map(([k]) => `<option ${d.used===k?'selected':''}>${k}</option>`).join('')}</select></div>
+      <div><label>Project title</label><input value="${esc(d.title)}" onchange="U.draft.title=this.value"></div>
+      <div><label>Components and quantity</label><div id="lines">${linesHtml()}</div>
+        <button class="btn ghost sm" onclick="U.draft.lines.push({cid:'',qty:1});linesRedraw()">+ Add another component</button></div>
+      <div><label>Purpose</label><textarea rows="3" onchange="U.draft.purpose=this.value">${esc(d.purpose)}</textarea></div>
       <div><button class="btn" onclick="submitReq()">Submit request</button></div>
     </div></div>`;
 }
 function actionCell(r, adm){
   const own = r.requester_id === ME.id;
   if (r.status === 'approved' && (adm || own))
-    return `<button class="btn ok sm" onclick="collect('${r.id}')">Mark collected</button>`;
+    return `<button class="btn ok sm" onclick="ask('Mark this item as collected?', () => collect('${r.id}'))">Mark collected</button>`;
   if (r.status === 'collected'){
     let out = '';
-    if (own || adm) out += `<button class="btn sm" onclick="returnItem('${r.id}')">Return to inventory</button> `;
-    if (adm) out += `<button class="btn ghost sm" onclick="remind('${r.id}')">Send return reminder</button>`;
+    if (own || adm) out += `<button class="btn sm" onclick="askReturn('${r.id}', ${r.qty})">Return to inventory</button> `;
+    if (adm) out += `<button class="btn ghost sm" onclick="ask('Send a return reminder to this person?', () => remind('${r.id}'))">Send return reminder</button>`;
     if (r.reminded_at) out += ` <span class="muted">Reminded ${fmt(r.reminded_at)}</span>`;
     return out;
   }
@@ -476,7 +583,7 @@ function vMy(){
   if (!list.length) return '<div class="card"><p class="empty">No requests yet.</p></div>';
   return `<div class="card"><h2>${adm ? 'All requests' : 'My requests'}</h2>${tbl(
     ['Item','Qty','Purpose','Used for','Requested by','Submitted','Status','Action'],
-    list.map(r => [esc(compName(r.component_id)), r.qty, esc(r.purpose), scopeBadge(r.scope),
+    list.map(r => [esc(compName(r.component_id)), r.qty, (r.project_title ? '<b>' + esc(r.project_title) + '</b> · ' : '') + (r.used_for ? esc(r.used_for) + ' · ' : '') + esc(r.purpose), scopeBadge(r.scope),
       esc(r.requester_name), fmt(r.created_at), badge(ST[r.status][0], ST[r.status][1])
         + (r.scope === 'spa' && r.status === 'pending' ? '<br><span class="muted" style="font-size:12px">' + spaProgress(r).replace(/<br>/g, ' · ') + '</span>' : ''),
       actionCell(r, adm)]))}</div>`;
@@ -488,13 +595,13 @@ function vAppr(){
     ['Requester','Role','Item','Qty','Purpose','Used for','Submitted','Decision'],
     list.map(r => [esc(r.requester_name), ROLE[r.requester_role] || '', esc(compName(r.component_id))
         + (r.scope === 'spa' ? '<br><span class="muted" style="font-size:12px">' + spaProgress(r).replace(/<br>/g, ' · ') + '</span>' : ''), r.qty,
-      esc(r.purpose), scopeBadge(r.scope), fmt(r.created_at),
-      `<button class="btn ok sm" onclick="decide('${r.id}','approved')">Approve</button>
+      (r.project_title ? '<b>' + esc(r.project_title) + '</b> · ' : '') + (r.used_for ? esc(r.used_for) + ' · ' : '') + esc(r.purpose), scopeBadge(r.scope), fmt(r.created_at),
+      `<button class="btn ok sm" onclick="ask('Approve this request?', () => decide('${r.id}','approved'))">Approve</button>
        <input id="rr${r.id}" placeholder="Reason (optional)" style="max-width:160px;display:inline-block;padding:4px 8px">
-       <button class="btn bad sm" onclick="decide('${r.id}','rejected')">Reject</button>`])
+       <button class="btn bad sm" onclick="ask('Reject this request?', () => decide('${r.id}','rejected'))">Reject</button>`])
   )}</div>`;
 }
-function vDash(){
+function vDashBase(){
   const done = S.requests.filter(r => r.status === 'collected');
   const grp = f => { const g = done.filter(f); return [g.length, g.reduce((a,r)=>a+r.qty,0)]; };
   const util = [
@@ -534,7 +641,7 @@ function vImp(){
       <label style="display:flex;gap:8px;align-items:center;margin-top:12px;font-weight:600;color:var(--ink)">
         <input type="checkbox" id="rep" style="width:auto"> Replace current stock with this file (first full load of your sheet)</label>
       <div class="row" style="margin-top:14px">
-        <button class="btn" ${valid ? '' : 'disabled'} onclick="commitImport()">Import ${valid} valid row${valid===1?'':'s'}</button>
+        <button class="btn" ${valid ? '' : 'disabled'} onclick="ask('Import these rows into the inventory?', () => commitImport())">Import ${valid} valid row${valid===1?'':'s'}</button>
         <button class="btn ghost" onclick="U.preview=null;render()">Cancel</button>
       </div></div>`;
   }
@@ -561,10 +668,10 @@ function vAcc(){
   const rows = S.profiles.map(p => [
     esc(p.email), esc(p.name),
     p.id === ME.id ? '<span class="muted">you</span>'
-      : `<select id="role-${p.id}">${opts(p.role)}</select> <button class="btn ghost sm" onclick="setRole('${p.id}', document.getElementById('role-${p.id}').value)">Save role</button>`,
+      : `<select id="role-${p.id}">${opts(p.role)}</select> <button class="btn ghost sm" onclick="ask('Change this person access?', () => setRole('${p.id}', document.getElementById('role-${p.id}').value))">Save role</button>`,
     p.id === ME.id ? '' : (U.askAcc === p.id
-      ? `<button class="btn bad sm" onclick="removeAccount('${p.id}')">Confirm remove</button> <button class="btn ghost sm" onclick="U.askAcc=null;render()">Cancel</button>`
-      : `<button class="btn ghost sm" onclick="U.askAcc='${p.id}';render()">Remove</button>`)
+      ? `<button class="btn bad sm" onclick="ask('Remove this account?', () => removeAccount('${p.id}'))">Confirm remove</button> <button class="btn ghost sm" onclick="U.askAcc=null;render()">Cancel</button>`
+      : `<button class="btn ghost sm" onclick="ask('Remove this account?', () => removeAccount('${p.id}'))">Remove</button>`)
   ]);
   return `<div class="card" style="margin-bottom:16px"><h2>Add account</h2>
       <div class="form">
@@ -572,7 +679,7 @@ function vAcc(){
         <div><label>Name</label><input id="an"></div>
         <div><label>Role</label><select id="ar">${opts('student')}</select></div>
         <div><label>Temporary password (8+ characters)</label><input id="ap" type="password"></div>
-        <div><button class="btn" onclick="createAccount()">Create account</button></div>
+        <div><button class="btn" onclick="ask('Create this account?', () => createAccount())">Create account</button></div>
       </div>
       <p class="muted" style="margin:10px 0 0">Give the person their password. Choose "No access" to block someone without deleting their history.</p>
     </div>
@@ -580,7 +687,7 @@ function vAcc(){
       <div class="form">
         <div><label>Account</label><select id="rpuser">${S.profiles.filter(p => p.id !== ME.id).map(p => `<option value="${p.id}">${esc(p.email)}</option>`).join('')}</select></div>
         <div><label>New password (8+ characters)</label><input id="rppw" type="password"></div>
-        <div><button class="btn" onclick="resetPassword()">Set password</button></div>
+        <div><button class="btn" onclick="ask('Set this new password for the account?', () => resetPassword())">Set password</button></div>
       </div>
     </div>
     <div class="card"><h2>Accounts</h2>${tbl(['Email','Name','Role','Remove'], rows)}</div>`;
@@ -596,7 +703,7 @@ function vNotes(){
   const list = S.notes || [];
   return `<div class="card" style="margin-bottom:16px"><div class="row" style="justify-content:space-between">
       <h2 style="margin:0">Notifications</h2>
-      <button class="btn ghost sm" onclick="markAllRead()">Mark all read</button></div>
+      <button class="btn ghost sm" onclick="ask('Mark all notifications as read?', () => markAllRead())">Mark all read</button></div>
     ${list.length ? '<ul style="margin:12px 0 0;padding-left:18px">' + list.map(n =>
       `<li style="margin-bottom:6px;${n.is_read ? 'color:var(--muted)' : 'font-weight:600'}">${esc(n.message)} <span class="muted">· ${fmt(n.created_at)}</span></li>`
     ).join('') + '</ul>' : '<p class="empty">No notifications.</p>'}
@@ -619,8 +726,67 @@ function vSpa(){
       badge(ST[r.status][0], ST[r.status][1]), spaProgress(r),
       r.collected_at ? fmt(r.collected_at) : '-', r.returned_at ? fmt(r.returned_at) : '-']))}</div>`;
 }
+
+/* ===== Confirmation pop-up for every button ===== */
+let CONF = null;
+function ask(msg, fn){ CONF = {msg, fn}; renderConfirm(); }
+function renderConfirm(){
+  let el = document.getElementById('confirm');
+  if (!el){ el = document.createElement('div'); el.id = 'confirm'; document.body.appendChild(el); }
+  el.innerHTML = CONF ? `<div style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50">
+    <div class="card" style="max-width:380px;width:90%">
+      <h2>Please confirm</h2>
+      <p style="margin:0 0 16px">${esc(CONF.msg)}</p>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn ghost" onclick="closeConfirm()">Cancel</button>
+        <button class="btn" onclick="runConfirm()">Confirm</button>
+      </div></div></div>` : '';
+}
+function closeConfirm(){ CONF = null; renderConfirm(); }
+function runConfirm(){ const fn = CONF && CONF.fn; CONF = null; renderConfirm(); if (fn) fn(); }
+
+/* ===== Return with damaged units ===== */
+function askReturn(id, qty){
+  const el = document.getElementById('confirm') || (() => { const d = document.createElement('div'); d.id = 'confirm'; document.body.appendChild(d); return d; })();
+  CONF = null;
+  el.innerHTML = `<div style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50">
+    <div class="card" style="max-width:400px;width:90%">
+      <h2>Return to inventory</h2>
+      <p style="margin:0 0 12px">${qty} unit(s) are being returned. How many are damaged? Damaged units go to the red bin.</p>
+      <div style="margin-bottom:12px"><label>Damaged quantity (0 to ${qty})</label><input id="dmg" type="number" min="0" max="${qty}" value="0"></div>
+      <div style="margin-bottom:12px"><label>What happened (optional)</label><input id="dnote" placeholder="e.g. burnt during testing"></div>
+      <div class="row" style="justify-content:flex-end">
+        <button class="btn ghost" onclick="closeConfirm()">Cancel</button>
+        <button class="btn" onclick="confirmReturn('${id}', ${qty})">Confirm return</button>
+      </div></div></div>`;
+}
+function confirmReturn(id, qty){
+  const d = parseInt(document.getElementById('dmg').value, 10) || 0;
+  if (d < 0 || d > qty) return toast('Damaged quantity must be between 0 and ' + qty);
+  const note = (document.getElementById('dnote').value || '').trim() || null;
+  closeConfirm();
+  run(SB.rpc('return_request', {req_id: id, damaged: d, note}),
+      d ? `Returned. ${d} damaged unit(s) sent to the red bin` : 'Returned to inventory');
+}
+/* ===== Red bin (admin dashboard) ===== */
+function redBinCard(){
+  const list = S.damage || [];
+  const total = list.reduce((a, x) => a + x.qty, 0);
+  return `<div class="card" style="margin-top:16px"><h2>Red bin: damaged components</h2>
+    <p class="muted" style="margin-top:-8px">Total damaged units reported: <b>${total}</b></p>
+    ${list.length ? tbl(['Reported','Component','Damaged qty','Damaged by','Project','Purpose','Reported by','Note'],
+      list.map(d => [fmt(d.created_at), esc(compName(d.component_id)), d.qty, esc(d.damaged_by_name),
+        esc(d.project_title || '-'), esc(d.purpose || '-'), esc(profName(d.reported_by)), esc(d.note || '-')]))
+      : '<p class="empty">Nothing in the red bin.</p>'}</div>`;
+}
+function go(k){ U.tab = k; render(); if (P?.role === 'admin' && ['log','acc','dash','imp'].includes(k)) loadData(true); }
+function vDash(){ return vDashBase() + redBinCard(); }
 const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, spa:vSpa, dash:vDash, imp:vImp, log:vLog, acc:vAcc};
 
+function checkingView(msg){
+  return `<div class="login"><div class="brand" style="justify-content:center;margin-bottom:18px"><i></i>Component Inventory</div>
+    <div class="card"><p class="muted" style="margin:0">${msg || 'Checking your session…'}</p></div></div>`;
+}
 function loginView(){
   return `<div class="login"><div class="brand" style="justify-content:center;margin-bottom:18px"><i></i>Component Inventory</div>
     <div class="card">
@@ -628,18 +794,19 @@ function loginView(){
       <div><label>Email</label><input id="le" type="email"></div>
       <div><label>Password</label><input id="lp" type="password"></div>
       <div><label>Name (for new accounts)</label><input id="ln"></div>
-      <div class="row"><button class="btn" onclick="signIn()">Sign in</button><button class="btn ghost" onclick="signUp()">Create account</button></div>
+      <div class="row"><button class="btn" onclick="ask('Sign in now?', () => signIn())">Sign in</button><button class="btn ghost" onclick="ask('Create this account?', () => signUp())">Create account</button></div>
       <p class="muted" style="margin:0">Create an account with your @protosem.tech or @forge-iv.co email. An admin then gives you your access.</p>
     </div></div>`;
 }
 function render(){
   const app = document.getElementById('app');
+  if (!AUTH_READY){ app.innerHTML = checkingView(); return; }
   if (!ME){ app.innerHTML = loginView(); return; }
-  if (!P){ app.innerHTML = '<p class="empty">Loading…</p>'; return; }
+  if (!P){ app.innerHTML = checkingView('Loading your workspace…'); return; }
   if (!P.role){
     app.innerHTML = `<div class="login"><div class="card"><h2>Access not granted</h2>
       <p class="muted">${esc(P.email)} has no role yet. Ask the Engineers-Admin to set it.</p>
-      <button class="btn ghost" onclick="signOut()">Sign out</button></div></div>`;
+      <button class="btn ghost" onclick="ask('Sign out of the platform?', () => signOut())">Sign out</button></div></div>`;
     return;
   }
   const tabs = [['inv','Inventory'], ['req','New request'], ['my','Requests'],
@@ -649,9 +816,9 @@ function render(){
   if (!tabs.some(t => t[0] === U.tab)) U.tab = tabs[0][0];
   app.innerHTML = `<header>
       <div class="brand"><i></i>Component Inventory</div>
-      <nav>${tabs.map(([k,l]) => `<button class="${U.tab===k?'on':''}" onclick="U.tab='${k}';render()">${l}</button>`).join('')}</nav>
+      <nav>${tabs.map(([k,l]) => `<button class="${U.tab===k?'on':''}" onclick="go('${k}')">${l}</button>`).join('')}</nav>
       <div class="row"><button class="btn ghost sm" onclick="U.showN=!U.showN;render()">Notifications (${unreadCount()})</button><span class="badge b-info">${ROLE[P.role]}</span><span class="muted">${esc(P.name)}</span>
-        <button class="btn ghost sm" onclick="signOut()">Sign out</button></div>
+        <button class="btn ghost sm" onclick="ask('Sign out of the platform?', () => signOut())">Sign out</button></div>
     </header><main>${U.showN ? vNotes() : ''}${VIEWS[U.tab]()}</main>`;
 }
 render();
