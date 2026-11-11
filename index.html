@@ -72,8 +72,8 @@ const TEMPLATE = 'Component Name,Specifications,Overall Qty,Working Qty,Damaged 
 
 /* ================= State ================= */
 let ME = null, P = null, CH = null;
-let S = {components:[], requests:[], logs:[], imports:[], profiles:[], notes:[], approvals:[]};
-let POLL = null, TICK = 0, DIRTY = false, LAST_SIG = '', AUTH_READY = false;
+let S = {components:[], requests:[], logs:[], imports:[], profiles:[], notes:[], approvals:[], compReq:[], recReq:[], impReq:[]};
+let POLL = null, TICK = 0, DIRTY = false, LAST_SIG = '', LAST_EXTRA = '', AUTH_READY = false;
 let U = {tab:'', q:'', ask:null, askAcc:null, preview:null, fileName:''};
 
 /* ================= Helpers ================= */
@@ -85,7 +85,8 @@ const tbl = (h, rows) => `<div class="scroll"><table><thead><tr>${h.map(x=>`<th>
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),3000)}
 const scopeBadge = s => s === 'spa' ? badge('SPA','b-info') : badge('Team','b-ok');
 const compName = id => S.components.find(c=>c.id===id)?.name || '(removed)';
-const findByName = n => S.components.find(c=>c.name.toLowerCase()===n.toLowerCase());
+const findByName = (n, inv) => S.components.find(c=>c.name.toLowerCase()===n.toLowerCase() && c.inventory===inv);
+const invTag = c => c.inventory === 'spa' ? 'SPA' : 'Protosem';
 const profName = id => S.profiles.find(p=>p.id===id)?.name || 'System';
 // Mirrors can_approve() in the database
 const SPA_ROLES = ['engineer','manager','spalead','admin'];
@@ -96,6 +97,11 @@ function canDecide(r){
       && !(S.approvals || []).some(a => a.request_id === r.id && a.approver_role === P.role);
   if (P.role === 'admin') return true;
   return r.approver_role === P.role;
+}
+function normInv(t){
+  t = (t||'').toLowerCase().trim();
+  if (t.startsWith('spa')) return 'spa';
+  return 'protosem';
 }
 function normBoq(t){
   t = (t||'').toLowerCase().trim();
@@ -116,7 +122,10 @@ async function loadData(full){
     SB.from('components').select('*').order('name'),
     SB.from('requests').select('*').order('created_at', {ascending:true}),
     SB.from('notifications').select('*').order('created_at', {ascending:false}).limit(50),
-    SB.from('approvals').select('*')
+    SB.from('approvals').select('*'),
+    SB.from('component_requests').select('*').order('created_at', {ascending:true}),
+    SB.from('receive_requests').select('*').order('created_at', {ascending:true}),
+    SB.from('import_requests').select('*').order('created_at', {ascending:true})
   ];
   if (adminExtra) q.push(
     SB.from('profiles').select('*').order('email'),
@@ -127,12 +136,19 @@ async function loadData(full){
   const res = await Promise.all(q);
   const err = res.find(x => x.error);
   if (err) return toast('Could not load data: ' + err.error.message);
-  const sig = JSON.stringify(res.map(x => x.data));
-  if (sig === LAST_SIG) return;                 // nothing changed: do not redraw the screen
+  // Compare the same data each time, so the screen is only redrawn when something really changed
+  if (adminExtra) LAST_EXTRA = JSON.stringify(res.slice(7).map(x => x.data));
+  const sig = JSON.stringify(res.slice(0, 7).map(x => x.data)) + '|' + LAST_EXTRA;
+  if (sig === LAST_SIG) return;
   LAST_SIG = sig;
   S.components = res[0].data; S.requests = res[1].data; S.notes = res[2].data; S.approvals = res[3].data;
-  if (adminExtra){ S.profiles = res[4].data; S.logs = res[5].data; S.imports = res[6].data; S.damage = res[7].data; }
+  S.compReq = res[4].data; S.recReq = res[5].data; S.impReq = res[6].data;
+  if (adminExtra){ S.profiles = res[7].data; S.logs = res[8].data; S.imports = res[9].data; S.damage = res[10].data; }
   paint();
+}
+function apOpts(key){
+  return S.profiles.filter(p => p.id !== ME.id && ['engineer','manager','spalead'].includes(p.role))
+    .map(p => `<option value="${p.id}" ${U[key] === p.id ? 'selected' : ''}>${esc(p.name)} (${ROLE[p.role]})</option>`).join('');
 }
 // Do not redraw while someone is typing in a form; redraw as soon as they leave the field
 // Take focus off the current field before an action, so the screen is redrawn with the result
@@ -185,7 +201,7 @@ SB.auth.onAuthStateChange((_e, s) => {
   AUTH_READY = true;
   const user = s?.user || null;
   if (user && P && user.id === ME?.id){ ME = user; return; }   // same person: nothing to reload
-  ME = user; P = null; LAST_SIG = '';
+  ME = user; P = null; LAST_SIG = ''; LAST_EXTRA = '';
   if (ME) loadProfile(); else render();
 });
 
@@ -193,9 +209,13 @@ SB.auth.onAuthStateChange((_e, s) => {
 function addComp(){
   const name = v('nn');
   if (!name) return toast('Name is required');
+  if (!v('ninv')) return toast('Choose SPA or Protosem inventory');
+  if (!v('napp')) return toast('Choose the person who must approve this component');
   const row = {name, specifications: v('nsp'), overall_qty: +v('no')||0, working_qty: +v('nw')||0,
-    damaged_qty: +v('nd')||0, current_qty: +v('nq')||0, min_qty: +v('nm')||0, location: v('nl'), boq_type: v('nc')};
-  run(SB.from('components').insert(row), 'Component added', `Added new component "${name}" with qty ${row.current_qty}`);
+    damaged_qty: +v('nd')||0, current_qty: +v('nq')||0, min_qty: +v('nm')||0, location: v('nl'), boq_type: v('nc'),
+    inventory: v('ninv'), proposed_by: ME.id, proposed_by_name: P.name, approver_id: v('napp')};
+  run(SB.from('component_requests').insert(row), 'Sent for approval',
+    `${P.name} proposed new component "${name}" (${v('ninv') === 'spa' ? 'SPA' : 'Protosem'}) for approval`);
 }
 function receive(){
   const id = v('rcomp'), n = +v('rn');
@@ -210,7 +230,7 @@ async function removeComp(id){
   const c = S.components.find(x=>x.id===id);
   const {error} = await SB.from('components').delete().eq('id', id);
   if (error) return toast(error.code === '23503'
-    ? 'This item has requests, so it cannot be removed. Set its quantity to 0 instead.' : error.message);
+    ? 'This item is used in requests or the red bin, so it cannot be removed. Set its quantity to 0 instead.' : error.message);
   await logMsg(`Removed component "${c?.name}"`);
   toast('Component removed');
   await loadData();
@@ -275,7 +295,7 @@ function buildPreview(rows){
   const idx = (...ks) => { for (const k of ks){ const i = h.indexOf(k); if (i >= 0) return i; } return -1; };
   const col = {name:idx('componentname','name'), spec:idx('specifications','specification','specs'),
     overall:idx('overallqty','overall'), working:idx('workingqty','working'), damaged:idx('damagedqty','damaged'),
-    current:idx('currentqty','current','qty'), location:idx('location'), category:idx('boqtype','boq','category'), min:idx('minlevel','min')};
+    current:idx('currentqty','current','qty'), location:idx('location'), category:idx('boqtype','boq','category'), min:idx('minlevel','min'), inv:idx('inventory','inventoryname')};
   if (col.name < 0) return toast('Header must include "Component Name"');
   if (col.current < 0 && col.working < 0 && col.overall < 0) return toast('Header must include a quantity column, e.g. "Current Qty"');
   U.preview = rows.slice(1).map((r, i) => {
@@ -292,7 +312,7 @@ function buildPreview(rows){
     else if (!category) err = 'Unknown BoQ type';
     else if (current < 0 || working < 0 || damaged < 0 || overall < 0) err = 'Negative quantity';
     else if (!(current > 0 || working > 0 || overall > 0 || damaged > 0)) err = 'No quantity given';
-    return {line: i+2, name, spec: g('spec'), category, overall, working, damaged, current, min: n('min'), location: g('location'), err};
+    return {line: i+2, name, spec: g('spec'), category, inv: normInv(g('inventory')), overall, working, damaged, current, min: n('min'), location: g('location'), err};
   });
   render();
 }
@@ -353,53 +373,27 @@ async function pdfToCSV(buf){
 }
 async function commitImport(){
   const valid = U.preview.filter(p => !p.err);
+  const approver = v('iapp');
+  if (!approver) return toast('Choose the person who must approve this import');
   const replace = !!document.getElementById('rep')?.checked;
-  let added = 0, restocked = 0, failed = 0, removed = 0;
-  // Merge rows that share a name (the same as the restock rule: quantities add up)
+  // Merge rows that share a name and inventory (quantities add up)
   const groups = new Map();
   valid.forEach(p => {
-    const k = p.name.toLowerCase(), g = groups.get(k);
+    const k = p.name.toLowerCase() + '|' + p.inv, g = groups.get(k);
     if (!g) groups.set(k, {...p});
     else { g.overall += p.overall; g.working += p.working; g.damaged += p.damaged; g.current += p.current;
       g.location = g.location || p.location; g.spec = g.spec || p.spec; g.min = g.min || p.min; }
   });
-  // Replace mode: remove components that are not in the file. Items with requests are kept (history).
-  if (replace){
-    for (const c of S.components.filter(c => !groups.has(c.name.toLowerCase()))){
-      const {error} = await SB.from('components').delete().eq('id', c.id);
-      if (!error) removed++;
-    }
-  }
-  for (const p of groups.values()){
-    const m = findByName(p.name);
-    let res;
-    if (m){
-      const upd = replace
-        ? {overall_qty: p.overall, working_qty: p.working, damaged_qty: p.damaged, current_qty: p.current}
-        : {overall_qty: m.overall_qty + p.overall, working_qty: m.working_qty + p.working,
-           damaged_qty: m.damaged_qty + p.damaged, current_qty: m.current_qty + p.current};
-      if (p.location) upd.location = p.location;
-      if (p.min) upd.min_qty = p.min;
-      if (p.spec) upd.specifications = p.spec;
-      upd.boq_type = p.category;
-      res = await SB.from('components').update(upd).eq('id', m.id);
-      if (!res.error) restocked++;
-    } else {
-      res = await SB.from('components').insert({name: p.name, specifications: p.spec, overall_qty: p.overall,
-        working_qty: p.working, damaged_qty: p.damaged, current_qty: p.current, min_qty: p.min,
-        location: p.location, boq_type: p.category});
-      if (!res.error) added++;
-    }
-    if (res.error) failed++;
-  }
-  const skipped = U.preview.length - valid.length + failed;
-  await SB.from('imports').insert({imported_by: ME.id, file_name: U.fileName, added, restocked, skipped});
-  await logMsg(`CSV "${U.fileName}" processed: ${added} new, ${restocked} restocked, ${skipped} skipped` +
-    (replace ? `, ${removed} removed (opening stock replaced)` : ''));
+  const rows = [...groups.values()].map(p => ({name: p.name, inv: p.inv, spec: p.spec, category: p.category,
+    overall: p.overall, working: p.working, damaged: p.damaged, current: p.current, min: p.min, location: p.location}));
+  blurNow();
+  const {error} = await SB.from('import_requests').insert({file_name: U.fileName, rows, replace_stock: replace,
+    skipped: U.preview.length - valid.length, proposed_by: ME.id, proposed_by_name: P.name, approver_id: approver});
+  if (error) return toast(error.message);
   U.preview = null;
-  toast(`Import done: ${added} new, ${restocked} restocked`);
-  U.tab = 'log';
-  await loadData();
+  U.tab = 'appr';
+  toast('Import sent for approval');
+  await loadData(true);
 }
 
 /* ================= Accounts (admin only, through the Edge Function) ================= */
@@ -436,19 +430,25 @@ async function removeAccount(id){
 
 /* ================= Views ================= */
 function invBody(){
-  const q = U.q.toLowerCase(), adm = P.role === 'admin';
-  const list = S.components.filter(c => (c.name + ' ' + c.location + ' ' + (c.specifications||'')).toLowerCase().includes(q));
+  const q = (U.q || '').toLowerCase(), adm = P.role === 'admin';
+  const list = S.components.filter(c => (c.name + ' ' + (c.location||'') + ' ' + (c.specifications || '')).toLowerCase().includes(q)
+    && (!U.invf || (c.inventory || 'protosem') === U.invf));
   if (!list.length) return '<p class="empty">No components match.</p>';
-  return tbl(['Component','Specifications','Overall','Working','Damaged','Current','Location','BoQ Type', adm ? 'Admin' : ''],
-    list.map(c => [esc(c.name), esc(c.specifications || '-'), c.overall_qty, c.working_qty, c.damaged_qty,
-      `<b>${c.current_qty}</b>`, esc(c.location), badge(CATS[c.boq_type], 'b-info'),
-      adm ? (U.ask === c.id
-        ? `<button class="btn bad sm" onclick="ask('Remove this component from the inventory?', () => removeComp('${c.id}'))">Confirm remove</button> <button class="btn ghost sm" onclick="U.ask=null;render()">Cancel</button>`
-        : `<button class="btn ghost sm" onclick="receiveFocus('${c.id}')">+ Receive</button> <button class="btn bad sm" onclick="ask('Remove this component from the inventory?', () => removeComp('${c.id}'))">Remove</button>`) : '']));
-}
-function receiveFocus(id){
-  const sel = document.getElementById('rcomp');
-  if (sel){ sel.value = id; sel.scrollIntoView({behavior:'smooth', block:'center'}); }
+  // One row per component, with the stock split by inventory
+  const groups = new Map();
+  list.forEach(c => { const k = c.name.toLowerCase(); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); });
+  const rows = [...groups.values()].map(rs => {
+    const sum = f => rs.reduce((a, c) => a + (c[f] || 0), 0);
+    const first = rs[0];
+    const split = rs.map(c => badge(invTag(c) + ' - ' + c.current_qty, c.inventory === 'spa' ? 'b-warn' : 'b-ok')).join(' ');
+    const ids = '[' + rs.map(c => "'" + c.id + "'").join(',') + ']';
+    const act = adm ? `<button class="btn ghost sm" onclick="receiveFocus('${first.id}')">+ Receive</button>
+      <button class="btn bad sm" onclick="ask('Remove this component from every inventory?', () => removeGroup(${ids}))">Remove</button>` : '';
+    return [esc(first.name), esc(first.specifications || '-'), sum('overall_qty'), sum('working_qty'), sum('damaged_qty'),
+      `<b>${sum('current_qty')}</b>`, split, esc(rs.map(c => c.location).filter(Boolean).join(', ') || '-'),
+      badge(CATS[first.boq_type], 'b-info'), act];
+  });
+  return tbl(['Component','Specifications','Overall','Working','Damaged','Total current','Stock by inventory','Location','BoQ Type', adm ? 'Admin' : ''], rows);
 }
 function vInv(){
   const adm = P.role === 'admin';
@@ -463,19 +463,18 @@ function vInv(){
       <div><label>Min level</label><input id="nm" type="number" min="0" value="0"></div>
       <div><label>Location</label><input id="nl"></div>
       <div><label>BoQ Type</label><select id="nc">${Object.entries(CATS).map(([k,x])=>`<option value="${k}">${x}</option>`).join('')}</select></div>
+      <div><label>Inventory</label><select id="ninv"><option value="">Select SPA or Protosem</option><option value="spa">SPA</option><option value="protosem">Protosem</option></select></div>
+      <div><label>Approver (must approve before it is added)</label><select id="napp" onchange="U.napp=this.value"><option value="">Select approver</option>${apOpts('napp')}</select></div>
       <div><button class="btn" onclick="ask('Add this component to the inventory?', () => addComp())">Add</button></div>
     </div></div>
-    <div class="card" style="margin-bottom:16px"><h2>Receive stock</h2><div class="form">
-      <div><label>Component</label><select id="rcomp">${S.components.map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></div>
-      <div><label>Units received</label><input id="rn" type="number" min="1" value="1"></div>
-      <div><button class="btn" onclick="ask('Add these units to stock?', () => receive())">Add to stock</button></div>
-    </div></div>`;
+    <div class="card" style="margin-bottom:16px"><h2>Receive stock</h2><div style="margin-bottom:12px"><label>Approver (must approve before the stock is added)</label><select id="rapp" onchange="U.rapp=this.value"><option value="">Select approver</option>${apOpts('rapp')}</select></div><div id="rlines">${recvHtml()}</div><div class="row"><button class="btn ghost sm" onclick="U.recv.push({cid:'',n:1,inv:'protosem'});recvRedraw()">+ Add another component</button> <button class="btn" onclick="ask('Send these units for approval?', () => receiveAll())">Send for approval</button></div></div>`;
   return `${form}<div class="card">
     <div class="row" style="justify-content:space-between;margin-bottom:12px">
       <h2 style="margin:0">Inventory</h2>
       <input placeholder="Search" value="${esc(U.q)}" style="max-width:260px"
         oninput="U.q=this.value;document.getElementById('invbody').innerHTML=invBody()">
     </div>
+    <div style="margin-bottom:12px"><select style="max-width:220px" onchange="U.invf=this.value;document.getElementById('invbody').innerHTML=invBody()"><option value="">All inventories</option><option value="spa" ${U.invf==='spa'?'selected':''}>SPA only</option><option value="protosem" ${U.invf==='protosem'?'selected':''}>Protosem only</option></select></div>
     <div id="invbody">${invBody()}</div></div>`;
 }
 const USED = [['SPA','spa'],['Protosem PoC','team'],['Protosem Activity','team'],['Self learning','team']];
@@ -495,7 +494,7 @@ function linesHtml(){
     const c = S.components.find(x => x.id === l.cid);
     return `<div class="row" style="margin-bottom:8px">
       <div class="cb" id="cb${i}">
-        <input id="cbin${i}" autocomplete="off" placeholder="Type to search components" value="${esc(c ? c.name + ' (' + c.current_qty + ' available)' : '')}"
+        <input id="cbin${i}" autocomplete="off" placeholder="Type to search components" value="${esc(c ? c.name + ' [' + invTag(c) + '] (' + c.current_qty + ' available)' : '')}"
           oninput="cbFilter(${i}, this.value)" onfocus="cbFilter(${i}, '')"
           onblur="setTimeout(() => cbClose(${i}), 150)"
           onkeydown="if(event.key==='Enter'){event.preventDefault();cbEnter(${i})}">
@@ -513,7 +512,7 @@ function cbMatches(q){
 function cbPanel(i, q){
   const list = cbMatches(q);
   return list.length
-    ? list.map(c => `<div class="cb-opt" onmousedown="event.preventDefault();cbPick(${i}, '${c.id}')">${esc(c.name)} <span class="muted">· ${c.current_qty} available</span></div>`).join('')
+    ? list.map(c => `<div class="cb-opt" onmousedown="event.preventDefault();cbPick(${i}, '${c.id}')">${esc(c.name)} <span class="muted">· ${invTag(c)} · ${c.current_qty} available</span></div>`).join('')
     : '<div class="cb-empty">No component matches</div>';
 }
 function cbFilter(i, q){
@@ -525,7 +524,7 @@ function cbPick(i, id){
   const c = S.components.find(x => x.id === id);
   U.draft.lines[i].cid = id;
   const input = document.getElementById('cbin' + i);
-  if (input) input.value = c ? c.name + ' (' + c.current_qty + ' available)' : '';
+  if (input) input.value = c ? c.name + ' [' + invTag(c) + '] (' + c.current_qty + ' available)' : '';
   document.getElementById('cb' + i)?.classList.remove('open');
 }
 function cbEnter(i){
@@ -536,7 +535,7 @@ function cbClose(i){
   const l = U.draft.lines[i];
   const c = l && S.components.find(x => x.id === l.cid);
   const input = document.getElementById('cbin' + i);
-  if (input) input.value = c ? c.name + ' (' + c.current_qty + ' available)' : '';
+  if (input) input.value = c ? c.name + ' [' + invTag(c) + '] (' + c.current_qty + ' available)' : '';
   document.getElementById('cb' + i)?.classList.remove('open');
 }
 function setLineComp(i, name){
@@ -588,7 +587,7 @@ function vMy(){
         + (r.scope === 'spa' && r.status === 'pending' ? '<br><span class="muted" style="font-size:12px">' + spaProgress(r).replace(/<br>/g, ' · ') + '</span>' : ''),
       actionCell(r, adm)]))}</div>`;
 }
-function vAppr(){
+function vApprBase(){
   const list = S.requests.filter(canDecide);
   if (!list.length) return '<div class="card"><p class="empty">No requests waiting for your approval.</p></div>';
   return `<div class="card"><h2>Pending approvals</h2>${tbl(
@@ -636,12 +635,13 @@ function vImp(){
       ['Line','Item','Specifications','BoQ Type','Overall','Working','Damaged','Current','Action','Issue'],
       p.map(x => [x.line, esc(x.name), esc(x.spec), x.category ? badge(CATS[x.category], 'b-info') : '-',
         x.overall, x.working, x.damaged, x.current,
-        x.err ? badge('Error', 'b-bad') : (findByName(x.name) ? badge('Restock +' + x.current, 'b-warn') : badge('New item', 'b-ok')),
+        x.err ? badge('Error', 'b-bad') : (findByName(x.name, x.inv) ? badge('Restock +' + x.current, 'b-warn') : badge('New item', 'b-ok')),
         esc(x.err)]))}
       <label style="display:flex;gap:8px;align-items:center;margin-top:12px;font-weight:600;color:var(--ink)">
-        <input type="checkbox" id="rep" style="width:auto"> Replace current stock with this file (first full load of your sheet)</label>
+        <input type="checkbox" id="rep" style="width:auto" onchange="U.irep=this.checked" ${U.irep ? 'checked' : ''}> Replace current stock with this file (first full load of your sheet)</label>
+      <div style="margin-top:12px"><label>Approver (must approve before the rows are added)</label><select id="iapp" onchange="U.iapp=this.value"><option value="">Select approver</option>${apOpts('iapp')}</select></div>
       <div class="row" style="margin-top:14px">
-        <button class="btn" ${valid ? '' : 'disabled'} onclick="ask('Import these rows into the inventory?', () => commitImport())">Import ${valid} valid row${valid===1?'':'s'}</button>
+        <button class="btn" ${valid ? '' : 'disabled'} onclick="ask('Send this import for approval?', () => commitImport())">Send ${valid} row${valid===1?'':'s'} for approval</button>
         <button class="btn ghost" onclick="U.preview=null;render()">Cancel</button>
       </div></div>`;
   }
@@ -779,8 +779,208 @@ function redBinCard(){
         esc(d.project_title || '-'), esc(d.purpose || '-'), esc(profName(d.reported_by)), esc(d.note || '-')]))
       : '<p class="empty">Nothing in the red bin.</p>'}</div>`;
 }
+
+/* ===== Receive stock: several components at once ===== */
+function recvHtml(){
+  U.recv = U.recv || [{cid:'', n:1, inv:'protosem'}];
+  const r = U.recv;
+  // Every component name is listed, whichever inventory it is in
+  const names = [...new Map(S.components.map(c => [c.name.toLowerCase(), c])).values()]
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return r.map((l, i) => {
+    const cur = S.components.find(x => x.id === l.cid);
+    const curKey = cur ? cur.name.toLowerCase() : '';
+    return `<div class="row" style="margin-bottom:8px">
+      <select style="flex:1" onchange="U.recv[${i}].inv=this.value;recvRedraw()">
+        <option value="protosem" ${l.inv==='protosem'?'selected':''}>Protosem</option>
+        <option value="spa" ${l.inv==='spa'?'selected':''}>SPA</option>
+      </select>
+      <select style="flex:2" onchange="U.recv[${i}].cid=this.value">
+        <option value="">Select a component</option>
+        ${names.map(c => `<option value="${c.id}" ${curKey===c.name.toLowerCase()?'selected':''}>${esc(c.name)}</option>`).join('')}
+      </select>
+      <input type="number" min="1" value="${l.n}" style="flex:1" onchange="U.recv[${i}].n=+this.value">
+      ${r.length > 1 ? `<button class="btn ghost sm" onclick="U.recv.splice(${i},1);recvRedraw()">Remove</button>` : ''}
+    </div>`;
+  }).join('');
+}
+function recvRedraw(){ const el = document.getElementById('rlines'); if (el) el.innerHTML = recvHtml(); }
+async function receiveAll(){
+  const lines = (U.recv || []).filter(l => l.cid && l.n > 0);
+  if (!lines.length) return toast('Choose a component and the units received');
+  const approver = v('rapp');
+  if (!approver) return toast('Choose the person who must approve this stock');
+  // Total per component name and inventory
+  const totals = new Map();
+  for (const l of lines){
+    const rep = S.components.find(x => x.id === l.cid);
+    if (!rep) continue;
+    const key = rep.name.toLowerCase() + '|' + l.inv;
+    const t = totals.get(key) || {rep, inv: l.inv, n: 0};
+    t.n += (+l.n);
+    totals.set(key, t);
+  }
+  blurNow();
+  for (const t of totals.values()){
+    const row = S.components.find(x => x.name.toLowerCase() === t.rep.name.toLowerCase() && x.inventory === t.inv);
+    let res;
+    if (row){
+      // Existing row: the approver confirms the units before they are added
+      res = await SB.from('receive_requests').insert({component_id: row.id, qty: t.n, proposed_by: ME.id,
+        proposed_by_name: P.name, approver_id: approver});
+    } else {
+      // Not in this inventory yet: the approver confirms creating it with these units
+      res = await SB.from('component_requests').insert({name: t.rep.name, specifications: t.rep.specifications || '',
+        location: t.rep.location || '', boq_type: t.rep.boq_type, min_qty: t.rep.min_qty || 0, inventory: t.inv,
+        overall_qty: t.n, working_qty: t.n, current_qty: t.n, damaged_qty: 0,
+        proposed_by: ME.id, proposed_by_name: P.name, approver_id: approver});
+    }
+    if (res.error) toast(res.error.message);
+  }
+  U.recv = [{cid:'', n:1, inv:'protosem'}];
+  toast('Sent for approval');
+  await loadData(true);
+}
+function receiveFocus(id){
+  const c = S.components.find(x => x.id === id);
+  U.recv = [{cid:id, n:1, inv: c ? c.inventory : 'protosem'}];
+  recvRedraw();
+  document.getElementById('rlines')?.scrollIntoView({behavior:'smooth', block:'center'});
+}
+async function removeGroup(ids){
+  U.ask = null;
+  let failed = 0;
+  const names = [];
+  for (const id of ids){
+    const c = S.components.find(x => x.id === id);
+    const {error} = await SB.from('components').delete().eq('id', id);
+    if (error) failed++; else if (c) names.push(c.name + ' (' + invTag(c) + ')');
+  }
+  if (names.length) await logMsg('Removed component ' + names.join(', '));
+  toast(failed ? 'Some inventories have requests, so they could not be removed' : 'Component removed');
+  await loadData(true);
+}
 function go(k){ U.tab = k; render(); if (P?.role === 'admin' && ['log','acc','dash','imp'].includes(k)) loadData(true); }
 function vDash(){ return vDashBase() + redBinCard(); }
+function compCard(){
+  const cr = S.compReq || [], rr = S.recReq || [];
+  const inv = r => r.inventory === 'spa' ? 'SPA' : 'Protosem';
+  const mine = cr.filter(r => r.approver_id === ME.id && r.status === 'pending');
+  const mineRec = rr.filter(r => r.approver_id === ME.id && r.status === 'pending');
+  const waiting = cr.filter(r => r.proposed_by === ME.id && r.status === 'pending');
+  const waitingRec = rr.filter(r => r.proposed_by === ME.id && r.status === 'pending');
+  const recent = cr.filter(r => r.proposed_by === ME.id && r.status !== 'pending').slice(-5).reverse();
+  let html = '';
+  if (mine.length) html += `<div class="card" style="margin-bottom:16px"><h2>New components waiting for your approval</h2>${tbl(
+    ['Component','Specifications','Inventory','Current qty','Proposed by','Submitted','Decision'],
+    mine.map(r => [esc(r.name), esc(r.specifications || '-'), inv(r), r.current_qty, esc(r.proposed_by_name || '-'), fmt(r.created_at),
+      `<button class="btn ok sm" onclick="ask('Approve adding this component?', () => approveComp('${r.id}'))">Approve</button>
+       <input id="crr${r.id}" placeholder="Reason (optional)" style="max-width:150px;display:inline-block;padding:4px 8px">
+       <button class="btn bad sm" onclick="ask('Reject this component?', () => rejectComp('${r.id}'))">Reject</button>`]))}</div>`;
+  if (mineRec.length) html += `<div class="card" style="margin-bottom:16px"><h2>Stock waiting for your approval</h2>${tbl(
+    ['Component','Units to add','Proposed by','Submitted','Decision'],
+    mineRec.map(r => [esc(compName(r.component_id)), r.qty, esc(r.proposed_by_name || '-'), fmt(r.created_at),
+      `<button class="btn ok sm" onclick="ask('Approve adding these units to stock?', () => approveRec('${r.id}'))">Approve</button>
+       <input id="rrr${r.id}" placeholder="Reason (optional)" style="max-width:150px;display:inline-block;padding:4px 8px">
+       <button class="btn bad sm" onclick="ask('Reject these units?', () => rejectRec('${r.id}'))">Reject</button>`]))}</div>`;
+  if (waiting.length) html += `<div class="card" style="margin-bottom:16px"><h2>Your new components, waiting for approval</h2>${tbl(
+    ['Component','Inventory','Approver','Submitted'],
+    waiting.map(r => [esc(r.name), inv(r), esc(profName(r.approver_id)), fmt(r.created_at)]))}</div>`;
+  if (waitingRec.length) html += `<div class="card" style="margin-bottom:16px"><h2>Your stock, waiting for approval</h2>${tbl(
+    ['Component','Units','Approver','Submitted'],
+    waitingRec.map(r => [esc(compName(r.component_id)), r.qty, esc(profName(r.approver_id)), fmt(r.created_at)]))}</div>`;
+  if (recent.length) html += `<div class="card" style="margin-bottom:16px"><h2>Recent decisions on your components</h2>${tbl(
+    ['Component','Inventory','Result','Reason'],
+    recent.map(r => [esc(r.name), inv(r), badge(r.status === 'approved' ? 'Approved' : 'Rejected', r.status === 'approved' ? 'b-ok' : 'b-bad'), esc(r.reason || '-')]))}</div>`;
+  return html;
+}
+function vAppr(){
+  const toggle = `<div style="margin-bottom:12px"><button class="btn ghost" onclick="toggleAllComps()">${U.showAll ? 'Hide all components' : 'Show all components'}</button></div>`;
+  return toggle + (U.showAll ? allCompsCard() : '') + impCard() + compCard() + vApprBase();
+}
+async function approveComp(id){
+  blurNow();
+  const {error} = await SB.rpc('approve_component', {req: id});
+  if (error) return toast(error.message);
+  toast('Approved and added to inventory');
+  loadData(true);
+}
+async function rejectComp(id){
+  const reason = (document.getElementById('crr' + id)?.value || '').trim() || null;
+  blurNow();
+  const {error} = await SB.rpc('reject_component', {req: id, rej_reason: reason});
+  if (error) return toast(error.message);
+  toast('Rejected');
+  loadData(true);
+}
+async function approveRec(id){
+  blurNow();
+  const {error} = await SB.rpc('approve_receive', {req: id});
+  if (error) return toast(error.message);
+  toast('Approved and added to stock');
+  loadData(true);
+}
+async function rejectRec(id){
+  const reason = (document.getElementById('rrr' + id)?.value || '').trim() || null;
+  blurNow();
+  const {error} = await SB.rpc('reject_receive', {req: id, rej_reason: reason});
+  if (error) return toast(error.message);
+  toast('Rejected');
+  loadData(true);
+}
+async function approveImp(id){
+  blurNow();
+  const {error} = await SB.rpc('approve_import', {req: id});
+  if (error) return toast(error.message);
+  toast('Approved. The import has been applied.');
+  loadData(true);
+}
+async function rejectImp(id){
+  const reason = (document.getElementById('iir' + id)?.value || '').trim() || null;
+  blurNow();
+  const {error} = await SB.rpc('reject_import', {req: id, rej_reason: reason});
+  if (error) return toast(error.message);
+  toast('Import rejected');
+  loadData(true);
+}
+function impCard(){
+  const ir = S.impReq || [];
+  const mine = ir.filter(r => r.approver_id === ME.id && r.status === 'pending');
+  const waiting = ir.filter(r => r.proposed_by === ME.id && r.status === 'pending');
+  let html = '';
+  if (mine.length) html += `<div class="card" style="margin-bottom:16px"><h2>CSV imports waiting for your approval</h2>${tbl(
+    ['File','Rows','Replace current stock','Proposed by','Submitted','Decision'],
+    mine.map(r => [esc(r.file_name), r.rows.length, r.replace_stock ? 'Yes' : 'No', esc(r.proposed_by_name || '-'), fmt(r.created_at),
+      `<button class="btn ghost sm" onclick="toggleImpView('${r.id}')">${U.impView === r.id ? 'Hide items' : 'View items'}</button>
+       <button class="btn ok sm" onclick="ask('Approve this import and apply all rows?', () => approveImp('${r.id}'))">Approve</button>
+       <input id="iir${r.id}" placeholder="Reason (optional)" style="max-width:150px;display:inline-block;padding:4px 8px">
+       <button class="btn bad sm" onclick="ask('Reject this import?', () => rejectImp('${r.id}'))">Reject</button>`]))}</div>`;
+  const open = mine.find(r => r.id === U.impView);
+  if (open) html += `<div class="card" style="margin-bottom:16px"><h2>Items in "${esc(open.file_name)}"</h2>${impDetail(open)}</div>`;
+  if (waiting.length) html += `<div class="card" style="margin-bottom:16px"><h2>Your CSV imports, waiting for approval</h2>${tbl(
+    ['File','Rows','Approver','Submitted'],
+    waiting.map(r => [esc(r.file_name), r.rows.length, esc(profName(r.approver_id)), fmt(r.created_at)]))}</div>`;
+  return html;
+}
+function impDetail(r){
+  return tbl(['#','Component','Inventory','In stock now','Adding','Result'],
+    r.rows.map((x, i) => {
+      const c = S.components.find(y => y.name.toLowerCase() === x.name.toLowerCase() && (y.inventory || 'protosem') === x.inv);
+      const result = !c ? badge('New item', 'b-ok')
+        : (r.replace_stock ? badge('Set to ' + x.current, 'b-warn') : badge('Restock +' + x.current, 'b-warn'));
+      return [i + 1, esc(x.name), x.inv === 'spa' ? 'SPA' : 'Protosem', c ? c.current_qty : '-', x.current, result];
+    }));
+}
+function toggleImpView(id){ U.impView = U.impView === id ? null : id; render(); }
+function toggleAllComps(){ U.showAll = !U.showAll; render(); }
+function allCompsCard(){
+  const list = S.components.slice().sort((a, b) => a.name.localeCompare(b.name));
+  return `<div class="card" style="margin-bottom:16px"><h2>All components (${list.length})</h2>${list.length
+    ? tbl(['Component','Inventory','Overall','Working','Damaged','Current','Location','BoQ Type'],
+        list.map(c => [esc(c.name), invTag(c), c.overall_qty, c.working_qty, c.damaged_qty, `<b>${c.current_qty}</b>`,
+          esc(c.location || '-'), badge(CATS[c.boq_type], 'b-info')]))
+    : '<p class="empty">No components yet.</p>'}</div>`;
+}
 const VIEWS = {inv:vInv, req:vReq, my:vMy, appr:vAppr, spa:vSpa, dash:vDash, imp:vImp, log:vLog, acc:vAcc};
 
 function checkingView(msg){
