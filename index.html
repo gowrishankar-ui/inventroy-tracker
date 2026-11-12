@@ -5,8 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Component Inventory</title>
 <style>
-:root{--bg:#f5f5f6;--card:#fff;--ink:#404042;--muted:#6d6e71;--line:#e4e4e6;--brand:#F15A22;--brand-2:#fdeae2;--ok:#15803d;--ok-2:#e7f7ec;--warn:#A8570B;--warn-2:#fdf1dc;--bad:#ED1C24;--bad-2:#fde4e5;--radius:12px}
-@media (prefers-color-scheme:dark){:root{--bg:#1b1b1d;--card:#262628;--ink:#ececee;--muted:#a7a8ab;--line:#3a3a3d;--brand:#F7874E;--brand-2:#3d2a20;--ok-2:#15301f;--warn-2:#3a2a10;--bad-2:#3a1717}}
+:root{--bg:#ffffff;--card:#ffffff;--ink:#404042;--muted:#6d6e71;--line:#e4e4e6;--brand:#F15A22;--brand-2:#fdeae2;--ok:#15803d;--ok-2:#e7f7ec;--warn:#A8570B;--warn-2:#fdf1dc;--bad:#ED1C24;--bad-2:#fde4e5;--radius:12px}
 *{box-sizing:border-box}
 body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink)}
 header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:12px 24px}
@@ -116,7 +115,7 @@ async function logMsg(message){
 
 /* ================= Data ================= */
 async function loadData(full){
-  const adminOn = P.role === 'admin' && ['log','acc','dash','imp'].includes(U.tab);
+  const adminOn = ['admin','engineer','manager','spalead'].includes(P.role) && ['log','acc','dash','imp'].includes(U.tab);
   const adminExtra = adminOn && (full || TICK % 4 === 0);
   const q = [
     SB.from('components').select('*').order('name'),
@@ -146,8 +145,9 @@ async function loadData(full){
   if (adminExtra){ S.profiles = res[7].data; S.logs = res[8].data; S.imports = res[9].data; S.damage = res[10].data; }
   paint();
 }
-function apOpts(key){
-  return S.profiles.filter(p => p.id !== ME.id && ['engineer','manager','spalead'].includes(p.role))
+function apOpts(key, roles){
+  roles = roles || ['engineer','manager','spalead'];
+  return S.profiles.filter(p => p.id !== ME.id && roles.includes(p.role))
     .map(p => `<option value="${p.id}" ${U[key] === p.id ? 'selected' : ''}>${esc(p.name)} (${ROLE[p.role]})</option>`).join('');
 }
 // Do not redraw while someone is typing in a form; redraw as soon as they leave the field
@@ -443,6 +443,7 @@ function invBody(){
     const split = rs.map(c => badge(invTag(c) + ' - ' + c.current_qty, c.inventory === 'spa' ? 'b-warn' : 'b-ok')).join(' ');
     const ids = '[' + rs.map(c => "'" + c.id + "'").join(',') + ']';
     const act = adm ? `<button class="btn ghost sm" onclick="receiveFocus('${first.id}')">+ Receive</button>
+      <button class="btn ghost sm" onclick="askLocation(${ids})">Location</button>
       <button class="btn bad sm" onclick="ask('Remove this component from every inventory?', () => removeGroup(${ids}))">Remove</button>` : '';
     return [esc(first.name), esc(first.specifications || '-'), sum('overall_qty'), sum('working_qty'), sum('damaged_qty'),
       `<b>${sum('current_qty')}</b>`, split, esc(rs.map(c => c.location).filter(Boolean).join(', ') || '-'),
@@ -464,7 +465,7 @@ function vInv(){
       <div><label>Location</label><input id="nl"></div>
       <div><label>BoQ Type</label><select id="nc">${Object.entries(CATS).map(([k,x])=>`<option value="${k}">${x}</option>`).join('')}</select></div>
       <div><label>Inventory</label><select id="ninv"><option value="">Select SPA or Protosem</option><option value="spa">SPA</option><option value="protosem">Protosem</option></select></div>
-      <div><label>Approver (must approve before it is added)</label><select id="napp" onchange="U.napp=this.value"><option value="">Select approver</option>${apOpts('napp')}</select></div>
+      <div><label>Approver (must approve before it is added)</label><select id="napp" onchange="U.napp=this.value"><option value="">Select approver</option>${apOpts('napp', ['engineer','manager','spalead','admin'])}</select></div>
       <div><button class="btn" onclick="ask('Add this component to the inventory?', () => addComp())">Add</button></div>
     </div></div>
     <div class="card" style="margin-bottom:16px"><h2>Receive stock</h2><div style="margin-bottom:12px"><label>Approver (must approve before the stock is added)</label><select id="rapp" onchange="U.rapp=this.value"><option value="">Select approver</option>${apOpts('rapp')}</select></div><div id="rlines">${recvHtml()}</div><div class="row"><button class="btn ghost sm" onclick="U.recv.push({cid:'',n:1,inv:'protosem'});recvRedraw()">+ Add another component</button> <button class="btn" onclick="ask('Send these units for approval?', () => receiveAll())">Send for approval</button></div></div>`;
@@ -860,8 +861,85 @@ async function removeGroup(ids){
   toast(failed ? 'Some inventories have requests, so they could not be removed' : 'Component removed');
   await loadData(true);
 }
-function go(k){ U.tab = k; render(); if (P?.role === 'admin' && ['log','acc','dash','imp'].includes(k)) loadData(true); }
-function vDash(){ return vDashBase() + redBinCard(); }
+
+/* ===== Admin password check, clear all inventory, and change location ===== */
+let PW_FN = null, LOC_IDS = [];
+function openDialog(inner){
+  const el = document.getElementById('confirm') || (() => { const d = document.createElement('div'); d.id = 'confirm'; document.body.appendChild(d); return d; })();
+  CONF = null;
+  el.innerHTML = `<div style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50">
+    <div class="card" style="max-width:420px;width:90%">${inner}</div></div>`;
+  return el;
+}
+function askPassword(msg, fn){
+  PW_FN = fn;
+  openDialog(`<h2>Admin password needed</h2>
+    <p style="margin:0 0 12px">${esc(msg)}</p>
+    <div style="margin-bottom:12px"><label>Your admin password</label><input id="pwin" type="password"></div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn ghost" onclick="closeConfirm()">Cancel</button>
+      <button class="btn bad" onclick="runPassword()">Confirm</button>
+    </div>`);
+  setTimeout(() => document.getElementById('pwin')?.focus(), 50);
+}
+function runPassword(){
+  const pw = document.getElementById('pwin')?.value || '';
+  const fn = PW_FN;
+  closeConfirm();
+  if (!pw) return toast('Enter your admin password');
+  if (fn) fn(pw);
+}
+async function clearAll(pw){
+  const {error: authErr} = await SB.auth.signInWithPassword({email: P.email, password: pw});
+  if (authErr) return toast('Wrong admin password. Nothing was cleared.');
+  const {error} = await SB.from('components').update({overall_qty: 0, working_qty: 0, damaged_qty: 0, current_qty: 0}).gte('overall_qty', 0);
+  if (error) return toast(error.message);
+  await logMsg(`${P.name} cleared all inventory (stock set to 0)`);
+  toast('All inventory cleared');
+  await loadData(true);
+}
+function askLocation(ids){
+  LOC_IDS = ids;
+  const cur = (S.components.find(c => c.id === ids[0]) || {}).location || '';
+  openDialog(`<h2>Change location</h2>
+    <p class="muted" style="margin:0 0 12px">The new location is applied to this component in every inventory.</p>
+    <div style="margin-bottom:12px"><label>Location</label><input id="locin" value="${esc(cur)}"></div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn ghost" onclick="closeConfirm()">Cancel</button>
+      <button class="btn" onclick="saveLocation()">Save location</button>
+    </div>`);
+  setTimeout(() => document.getElementById('locin')?.focus(), 50);
+}
+async function saveLocation(){
+  const loc = (document.getElementById('locin')?.value || '').trim();
+  const ids = LOC_IDS || [];
+  closeConfirm();
+  if (!ids.length) return;
+  const name = (S.components.find(c => c.id === ids[0]) || {}).name || 'component';
+  const {error} = await SB.from('components').update({location: loc}).in('id', ids);
+  if (error) return toast(error.message);
+  await logMsg(`Location of ${name} changed to ${loc || '(none)'}`);
+  toast('Location updated');
+  await loadData(true);
+}
+function dangerCard(){
+  return `<div class="card" style="margin-bottom:16px;border-top:3px solid var(--bad)"><h2>Clear all inventory</h2>
+    <p class="muted" style="margin-top:-8px">Sets the stock of every component to 0. Components, requests and history are kept. You will be asked for your admin password.</p>
+    <button class="btn bad" onclick="askPassword('Clear ALL inventory? Every stock quantity will be set to 0.', clearAll)">Clear all inventory</button></div>`;
+}
+function go(k){ U.tab = k; render(); if (['admin','engineer','manager','spalead'].includes(P?.role) && ['log','acc','dash','imp'].includes(k)) loadData(true); }
+function spaCard(){
+  const spa = S.components.filter(c => c.inventory === 'spa');
+  const prot = S.components.filter(c => (c.inventory || 'protosem') !== 'spa');
+  const units = a => a.reduce((x, c) => x + c.current_qty, 0);
+  const rows = spa.slice().sort((a, b) => a.name.localeCompare(b.name));
+  return `<div class="card" style="margin-top:16px"><h2>SPA components</h2>
+    <p class="muted" style="margin-top:-8px">SPA: ${spa.length} items, ${units(spa)} units in stock &middot; Protosem: ${prot.length} items, ${units(prot)} units in stock</p>
+    ${rows.length ? tbl(['Component','Overall','Working','Damaged','Current (SPA)','Location','BoQ Type'],
+      rows.map(c => [esc(c.name), c.overall_qty, c.working_qty, c.damaged_qty, `<b>${c.current_qty}</b>`, esc(c.location || '-'), badge(CATS[c.boq_type], 'b-info')]))
+      : '<p class="empty">No SPA components yet.</p>'}</div>`;
+}
+function vDash(){ return (P.role === 'admin' ? dangerCard() : '') + vDashBase() + spaCard() + redBinCard(); }
 function compCard(){
   const cr = S.compReq || [], rr = S.recReq || [];
   const inv = r => r.inventory === 'spa' ? 'SPA' : 'Protosem';
@@ -1012,7 +1090,8 @@ function render(){
   const tabs = [['inv','Inventory'], ['req','New request'], ['my','Requests'],
     ...(APPROVERS.includes(P.role) ? [['appr','Approvals']] : []),
     ...(['spalead','admin'].includes(P.role) ? [['spa','SPA history']] : []),
-    ...(P.role === 'admin' ? [['dash','Dashboard'], ['imp','CSV import'], ['log','Activity'], ['acc','Accounts']] : [])];
+    ...(['engineer','manager','spalead','admin'].includes(P.role) ? [['dash','Dashboard']] : []),
+    ...(P.role === 'admin' ? [['imp','CSV import'], ['log','Activity'], ['acc','Accounts']] : [])];
   if (!tabs.some(t => t[0] === U.tab)) U.tab = tabs[0][0];
   app.innerHTML = `<header>
       <div class="brand"><i></i>Component Inventory</div>
