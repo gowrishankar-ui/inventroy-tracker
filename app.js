@@ -1241,9 +1241,9 @@ function loginView(){
 }
 function render(){
   const app = document.getElementById('app');
-  if (!AUTH_READY){ app.innerHTML = checkingView(); return; }
-  if (!ME){ app.innerHTML = loginView(); return; }
-  if (!P){ app.innerHTML = checkingView('Loading your workspace…'); return; }
+  if (!AUTH_READY){ if (!app.dataset.ready) app.innerHTML = checkingView(); return; }
+  if (!ME){ app.dataset.ready = ''; app.innerHTML = loginView(); return; }
+  if (!P){ if (!app.dataset.ready) app.innerHTML = checkingView('Loading your workspace…'); return; }
   if (!P.role){
     app.innerHTML = `<div class="login"><div class="card"><h2>Access not granted</h2>
       <p class="muted">${esc(P.email)} has no role yet. Ask the Engineers-Admin to set it.</p>
@@ -1256,6 +1256,7 @@ function render(){
     ...(['engineer','spalead','admin'].includes(P.role) ? [['dash','Dashboard']] : []),
     ...(P.role === 'admin' ? [['imp','CSV import'], ['log','Activity'], ['acc','Accounts']] : [])];
   if (!tabs.some(t => t[0] === U.tab)) { location.replace(HREF[tabs[0][0]]); return; }   // not allowed here: go to the first page you can use
+  app.dataset.ready = '1';
   app.innerHTML = `<header>
       <div class="brand"><i aria-hidden="true"></i>Component Inventory</div>
       <nav aria-label="Main">${tabs.map(([k,l]) => `<a class="${U.tab===k?'on':''}" href="${HREF[k]}"${U.tab===k?' aria-current="page"':''}>${l}</a>`).join('')}</nav>
